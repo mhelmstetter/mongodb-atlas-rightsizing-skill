@@ -103,7 +103,7 @@ this skill will have DB access — `merge_verdict.py` works fine with only the r
 and produces a clearly-labeled Atlas-only output in that case; never block on this step.**
 
 ```bash
-python scripts/db_diagnostics.py --uri "<connection string>" --sample-interval 60 --out-dir ./rightsizing-report
+MONGODB_URI="<connection string>" python scripts/db_diagnostics.py --sample-interval 60 --out-dir ./rightsizing-report
 
 python scripts/merge_verdict.py --rightsizing-report ./rightsizing-report/report.json \
     --db-diagnostics ./rightsizing-report/db_diagnostics.json --out-dir ./rightsizing-report

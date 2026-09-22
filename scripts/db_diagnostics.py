@@ -18,7 +18,7 @@ kept separate and how the merge logic reasons about disagreements between the tw
 This script only runs read-only admin commands. It never writes to the database.
 
 Usage:
-  python db_diagnostics.py --uri "mongodb+srv://user:pass@cluster.../admin" \\
+  MONGODB_URI="mongodb+srv://user:pass@cluster.../admin" python db_diagnostics.py \\
       --databases mydb another_db --sample-interval 60 --out-dir ./report
 
   Omit --databases to auto-discover all non-system databases.
@@ -44,87 +44,81 @@ def get_server_status(client):
 
 
 def summarize_server_status(before, after, elapsed_s):
-    """Turn two point-in-time serverStatus snapshots into rates + pressure signals."""
-    wt_before = before.get("wiredTiger", {}).get("cache", {})
-    wt_after = after.get("wiredTiger", {}).get("cache", {})
+    """Turn two point-in-time serverStatus snapshots into rates + pressure signals.
 
-    def rate(path_fn):
-        try:
-            b = path_fn(before)
-            a = path_fn(after)
-            return round((a - b) / elapsed_s, 2) if elapsed_s > 0 else None
-        except (KeyError, TypeError):
-            return None
+    Counters are read by key, not with defaults: a missing counter is an error, not a zero rate
+    that would read as "no activity"."""
+    def rate(path):
+        b, a = before, after
+        for key in path:
+            b, a = b[key], a[key]
+        return round((a - b) / elapsed_s, 2)
 
-    opcounters = after.get("opcounters", {})
-    opcounters_before = before.get("opcounters", {})
-    op_rates = {
-        k: round((opcounters.get(k, 0) - opcounters_before.get(k, 0)) / max(elapsed_s, 1), 1)
-        for k in opcounters
-    }
+    op_rates = {k: rate(("opcounters", k)) for k in after["opcounters"]}
+    conns = after["connections"]
 
-    qe = after.get("metrics", {}).get("queryExecutor", {})
-    qe_before = before.get("metrics", {}).get("queryExecutor", {})
-    scanned_delta = qe.get("scanned", {}).get("total", 0) - qe_before.get("scanned", {}).get("total", 0) \
-        if isinstance(qe.get("scanned"), dict) else (qe.get("scanned", 0) - qe_before.get("scanned", 0))
-    returned_delta = op_rates.get("query", 0) * elapsed_s  # rough proxy
-
-    cache_bytes = wt_after.get("bytes currently in the cache")
-    cache_max = wt_after.get("maximum bytes configured")
-    cache_pct = round(100 * cache_bytes / cache_max, 1) if cache_bytes and cache_max else None
-
-    evicted_rate = rate(lambda s: s.get("wiredTiger", {}).get("cache", {}).get("pages evicted", 0))
-    read_into_cache_rate = rate(
-        lambda s: s.get("wiredTiger", {}).get("cache", {}).get("pages read into cache", 0)
-    )
-
-    conns = after.get("connections", {})
-
-    return {
-        "connections_current": conns.get("current"),
-        "connections_available": conns.get("available"),
-        "connections_pct_used": round(
-            100 * conns.get("current", 0) / (conns.get("current", 0) + conns.get("available", 1)), 1
-        ),
-        "wt_cache_bytes_used": cache_bytes,
-        "wt_cache_bytes_max": cache_max,
-        "wt_cache_pct_used": cache_pct,
-        "wt_pages_evicted_per_sec": evicted_rate,
-        "wt_pages_read_into_cache_per_sec": read_into_cache_rate,
+    summary = {
+        "process": after["process"],
+        "host": after["host"],
+        "connections_current": conns["current"],
+        "connections_available": conns["available"],
+        "connections_pct_used": round(100 * conns["current"] / (conns["current"] + conns["available"]), 1),
         "opcounters_per_sec": op_rates,
-        "scanned_per_sec_approx": round(scanned_delta / max(elapsed_s, 1), 1),
-        "resident_mem_mb": after.get("mem", {}).get("resident"),
-        "page_faults_total": after.get("extra_info", {}).get("page_faults"),
+        # Documents examined vs documents returned: a high ratio is the collection-scan /
+        # poor-index signal. (queryExecutor.scanned counts index keys examined, which is normal for
+        # indexed range queries, and opcounters.query leaves out aggregations.)
+        "scanned_objects_per_sec": rate(("metrics", "queryExecutor", "scannedObjects")),
+        "scanned_keys_per_sec": rate(("metrics", "queryExecutor", "scanned")),
+        "docs_returned_per_sec": rate(("metrics", "document", "returned")),
+        "resident_mem_mb": after["mem"]["resident"],
     }
 
+    # mongos has no storage engine, so no WiredTiger section. Recorded as unavailable rather than
+    # left out, so merge_verdict.py can say why the cache comparison didn't run.
+    if after["process"] == "mongos":
+        summary["wt_available"] = False
+        return summary
 
-def get_working_set(client, database_names):
+    cache = after["wiredTiger"]["cache"]
+    summary.update({
+        "wt_available": True,
+        "wt_cache_bytes_used": cache["bytes currently in the cache"],
+        "wt_cache_bytes_max": cache["maximum bytes configured"],
+        "wt_cache_pct_used": round(100 * cache["bytes currently in the cache"]
+                                   / cache["maximum bytes configured"], 1),
+        "wt_pages_evicted_per_sec": round(
+            rate(("wiredTiger", "cache", "unmodified pages evicted"))
+            + rate(("wiredTiger", "cache", "modified pages evicted")), 2),
+        "wt_pages_read_into_cache_per_sec": rate(("wiredTiger", "cache", "pages read into cache")),
+        "page_faults_total": after["extra_info"]["page_faults"],
+    })
+    return summary
+
+
+def get_data_footprint(client, database_names):
+    """dataSize + indexSize per database (plus the largest collections). This is the total data
+    footprint — an upper bound on the working set, not the working set itself: only the hot
+    subset of it needs to fit in cache."""
     result = {}
     for dbname in database_names:
         db = client[dbname]
-        try:
-            dbstats = db.command("dbStats")
-        except Exception as e:
-            result[dbname] = {"error": str(e)}
-            continue
+        dbstats = db.command("dbStats")
         colls = []
-        for coll_name in db.list_collection_names():
-            try:
-                cs = db.command("collStats", coll_name)
-                colls.append({
-                    "name": coll_name,
-                    "count": cs.get("count"),
-                    "size_bytes": cs.get("size"),
-                    "storage_size_bytes": cs.get("storageSize"),
-                    "total_index_size_bytes": cs.get("totalIndexSize"),
-                })
-            except Exception:
-                continue
-        colls.sort(key=lambda c: (c.get("size_bytes") or 0) + (c.get("total_index_size_bytes") or 0), reverse=True)
+        # type=collection leaves out views (collStats fails on them).
+        for coll_name in db.list_collection_names(filter={"type": "collection"}):
+            cs = db.command("collStats", coll_name)
+            colls.append({
+                "name": coll_name,
+                "count": cs["count"],
+                "size_bytes": cs["size"],
+                "storage_size_bytes": cs["storageSize"],
+                "total_index_size_bytes": cs["totalIndexSize"],
+            })
+        colls.sort(key=lambda c: c["size_bytes"] + c["total_index_size_bytes"], reverse=True)
         result[dbname] = {
-            "data_size_bytes": dbstats.get("dataSize"),
-            "index_size_bytes": dbstats.get("indexSize"),
-            "storage_size_bytes": dbstats.get("storageSize"),
+            "data_size_bytes": dbstats["dataSize"],
+            "index_size_bytes": dbstats["indexSize"],
+            "storage_size_bytes": dbstats["storageSize"],
             "collections": len(colls),
             "top_collections_by_footprint": colls[:10],
         }
@@ -133,14 +127,21 @@ def get_working_set(client, database_names):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--uri", required=True, help="MongoDB connection string (mongodb+srv://...)")
+    ap.add_argument("--uri", help="MongoDB connection string (mongodb+srv://...). Prefer the "
+                                   "MONGODB_URI env var so the password stays out of shell history "
+                                   "and the process list.")
     ap.add_argument("--databases", nargs="*", help="Databases to inspect; omit to auto-discover")
     ap.add_argument("--sample-interval", type=int, default=60,
                      help="Seconds between the two serverStatus samples used to compute rates (default 60)")
     ap.add_argument("--out-dir", default="./rightsizing-report")
     args = ap.parse_args()
+    uri = args.uri or os.environ.get("MONGODB_URI")
+    if not uri:
+        ap.error("provide the connection string via MONGODB_URI (preferred) or --uri")
+    if args.sample_interval < 1:
+        ap.error("--sample-interval must be at least 1 second")
 
-    client = MongoClient(args.uri, serverSelectionTimeoutMS=10000)
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
     client.admin.command("ping")  # fail fast on bad creds/network before waiting a full interval
 
     databases = args.databases or [
@@ -149,16 +150,19 @@ def main():
 
     print(f"Sampling serverStatus twice, {args.sample_interval}s apart, to compute rates...")
     before = get_server_status(client)
-    t0 = time.time()
     time.sleep(args.sample_interval)
     after = get_server_status(client)
-    elapsed = time.time() - t0
+    # Server-side elapsed time; also catches a restart between samples, which resets every counter.
+    elapsed = (after["uptimeMillis"] - before["uptimeMillis"]) / 1000
+    if after["host"] != before["host"] or elapsed <= 0:
+        sys.exit(f"The two serverStatus samples came from different processes or across a restart "
+                 f"({before['host']} -> {after['host']}, elapsed {elapsed}s); rates can't be computed.")
 
     diagnostics = {
         "sampled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sample_interval_s": round(elapsed, 1),
         "server_status_summary": summarize_server_status(before, after, elapsed),
-        "working_set": get_working_set(client, databases),
+        "data_footprint": get_data_footprint(client, databases),
     }
 
     os.makedirs(args.out_dir, exist_ok=True)

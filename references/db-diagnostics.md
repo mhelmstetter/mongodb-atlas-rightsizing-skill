@@ -8,23 +8,30 @@ cheaper and correct fix.
 
 `scripts/merge_verdict.py` implements the rules on this page as executable code — the table below
 and `TRIGGER_KEYWORDS`/`HIGH_SCAN_RATIO`/`WT_CACHE_MODERATE_PCT` in that script should stay in
-sync. One correction from testing the working-set-vs-cache rule against a real M10 cluster: gate
-primarily on `working_set > wt_cache_bytes_max` (decisive on its own), not on `wt_cache_pct_used`
-crossing some "near 100%" cutoff as a co-requirement — a real cluster showed `wt_cache_pct_used`
-at a moderate-looking 77.5% while its working set was already 18x the configured cache, which a
-strict "AND near-100%" gate would have missed entirely despite it being a genuinely decisive,
-high-confidence case.
+sync.
+
+**Total data size is not the working set.** `db_diagnostics.py` reports `data_footprint`
+(`dataSize` + `indexSize` per database) — the total data, an upper bound on the working set. Only
+the hot subset has to fit in cache. So the comparison with `wt_cache_bytes_max` is decisive in one
+direction only: if *all* data fits, the WiredTiger cache can't be the source of memory pressure.
+If total data exceeds the cache, that's context, not confirmation — a real M10 had total data 18x
+the cache while cache fill p95 was 78% and page faults p95 0.32/s, which points to a hot set that
+fits.
+
+Each combined finding is labeled `[AGREES]`, `[DISAGREES]`, or `[CONTEXT]`. Only results with an
+evaluated verdict (`scale_up`, `change_disk_or_iops`, `scale_down_candidate`, `no_change`) get
+combined analysis — not routers, paused/unsupported clusters, or `insufficient_data`.
 
 ## Signals and what they mean together
 
 | Atlas signal | DB-internal signal | Combined read |
 |---|---|---|
-| CPU p95 > 80% | `scanned_per_sec_approx` high relative to `opcounters.query` | Root cause is likely missing/poor indexes, not undersized compute. Recommend an index review (Atlas Performance Advisor or `explain()`) before a tier bump. |
-| Free memory low / high cache churn | `wt_cache_pct_used` near 100% **and** `working_set` total (sum of `data_size_bytes` + `index_size_bytes` for hot collections) exceeds `wt_cache_bytes_max` | Working set genuinely doesn't fit in RAM at the current tier — this is a real memory-driven scale-up case, not noise. Confidence: high. |
-| Free memory low, but... | `wt_cache_pct_used` is moderate and working set fits well under `wt_cache_bytes_max` | The OS-level memory pressure isn't coming from WiredTiger — could be another process, the OS page cache doing its normal thing, or a short spike. Lower confidence on a memory-driven scale-up; don't recommend one from this signal alone. |
+| CPU p95 > 80% | `scanned_objects_per_sec` / `docs_returned_per_sec` > `HIGH_SCAN_RATIO` (documents examined per document returned) | Root cause is likely missing/poor indexes, not undersized compute. Recommend an index review (Atlas Performance Advisor or `explain()`) before a tier bump. (Index keys scanned and `opcounters.query` aren't used: key scans are normal for indexed range queries, and `opcounters.query` leaves out aggregations.) |
+| Free memory low / cache fill high | Total data + indexes exceeds `wt_cache_bytes_max` | Context only: total data is an upper bound on the working set. Check the Atlas page-fault and cache-read rows and `wt_pages_read_into_cache_per_sec` before calling it memory-driven. |
+| Free memory low, but... | All data + indexes fit under `wt_cache_bytes_max` and `wt_cache_pct_used` is moderate | Disagreement: the OS-level memory pressure isn't coming from WiredTiger — another process, the OS page cache doing its normal thing, or a short spike. Don't recommend a memory-driven scale-up from this signal alone. |
 | Connections p95 near limit | `connections_pct_used` from serverStatus agrees | Corroborated — real connection pressure, likely a connection-pooling problem in the app as much as a tier problem. Worth mentioning both fixes. |
 | Connections p95 near limit | `connections_pct_used` is low | Disagreement — the Atlas-side number may reflect a different sampling window or a spike that's since resolved. Note the discrepancy in the report rather than picking one silently. |
-| Disk IOPS/utilization high | `wt_pages_read_into_cache_per_sec` high | Cache misses are driving disk reads — again points at working-set-vs-cache-size, reinforcing (or explaining) the IOPS signal rather than it being pure write-volume. |
+| Disk IOPS/latency high | `wt_pages_read_into_cache_per_sec` | Context only (any active cluster reads pages into cache): if it's a large share of read IOPS, cache misses are driving disk reads rather than write volume. |
 
 ## Rule: disagreement gets surfaced, not silently resolved
 
@@ -47,7 +54,12 @@ index is often a one-time change that removes the pressure entirely.
   cleaner rate if the workload is bursty. This makes the script take that long to run — mention
   this to the user before kicking it off.
 - Requires a user with `clusterMonitor` (for `serverStatus`) and `read` on the databases being
-  inspected (for `dbStats`/`collStats`). Don't ask for more than that.
+  inspected (for `dbStats`/`collStats`). Don't ask for more than that. A database it can't read
+  is an error, not a skipped entry — pass `--databases` to limit the scope.
+- Pass the connection string in `MONGODB_URI` rather than `--uri`, so the password stays out of
+  shell history and the process list.
+- Connecting through `mongos` gives no WiredTiger data (mongos has no storage engine); the
+  memory comparison then reports that instead of running.
 - On a sharded cluster, connect to `mongos` for cluster-wide dbStats, but also consider running
   `serverStatus` against individual shard primaries if a specific shard is suspected — a
   mongos-level view averages away a single hot shard the same way cluster-wide Atlas metrics can.

@@ -9,7 +9,7 @@ references/db-diagnostics.md — read that file before changing the thresholds b
 
 --db-diagnostics is OPTIONAL. Not every customer running this skill will have (or want to create)
 database-level credentials — only an Atlas API key is required to run rightsizing.py at all. When
---db-diagnostics is omitted, this script degrades gracefully: it passes the Atlas-only verdicts
+--db-diagnostics is omitted, it passes the Atlas-only verdicts
 through unchanged, clearly labeled as Atlas-only, with a note that db_diagnostics.py is available
 for deeper root-cause analysis if DB credentials become available later.
 
@@ -45,18 +45,23 @@ TRIGGER_KEYWORDS = {
     "latency": "latency p95",
 }
 
-# Heuristic ratio for "scanned per query is suspiciously high" — not derived from official docs,
-# same treatment as this project's other heuristic thresholds (page faults, disk latency). Tune
-# against your own workload; a query that legitimately needs to scan many documents (an
-# aggregation, a report query) will trip this without actually indicating a missing index.
+# Heuristic: documents examined per document returned. Not derived from official docs, same
+# treatment as this project's other heuristic thresholds (page faults, disk latency). A workload
+# that legitimately examines many documents per result (aggregations with $group, reports) trips
+# this without a missing index.
 HIGH_SCAN_RATIO = 10
 
-WT_CACHE_MODERATE_PCT = 60  # below this + working set fits under cache_max => "not WT, likely OS noise"
+WT_CACHE_MODERATE_PCT = 60  # below this + all data fits under cache_max => pressure isn't from WT
+
+# Verdicts that come from an evaluation of the hardware metrics; the others (paused,
+# not_supported, not_applicable for routers, insufficient_data) have nothing to corroborate.
+EVALUATED_VERDICTS = ("scale_up", "change_disk_or_iops", "scale_down_candidate", "no_change")
+
+# Finding kinds, rendered as the [PREFIX] in the report.
+AGREES, DISAGREES, CONTEXT = "agrees", "disagrees", "context"
 
 
 def load_json(path):
-    if not path or not os.path.exists(path):
-        return None
     with open(path) as f:
         return json.load(f)
 
@@ -65,107 +70,89 @@ def fired(reasons, keyword):
     return any(keyword in r for r in reasons)
 
 
-def working_set_bytes(working_set):
-    """Sum data + index size across every database db_diagnostics.py inspected. Returns None if
-    working_set is empty/missing/all-errored rather than a misleading 0."""
-    if not working_set:
-        return None
-    total = 0
-    saw_any = False
-    for db_name, stats in working_set.items():
-        if not isinstance(stats, dict) or "error" in stats:
-            continue
-        d = stats.get("data_size_bytes") or 0
-        i = stats.get("index_size_bytes") or 0
-        total += d + i
-        saw_any = True
-    return total if saw_any else None
+def total_data_bytes(data_footprint):
+    """Sum of dataSize + indexSize across every database db_diagnostics.py inspected — the total
+    data footprint, an upper bound on the working set."""
+    return sum(d["data_size_bytes"] + d["index_size_bytes"] for d in data_footprint.values())
 
 
-def analyze_cpu(reasons, db_summary):
-    if not fired(reasons, TRIGGER_KEYWORDS["cpu"]) or not db_summary:
+def analyze_cpu(reasons, db, window_label):
+    if not fired(reasons, TRIGGER_KEYWORDS["cpu"]):
         return None
-    op_rates = db_summary.get("opcounters_per_sec", {})
-    query_rate = op_rates.get("query", 0) or 0
-    scanned_rate = db_summary.get("scanned_per_sec_approx", 0) or 0
-    if scanned_rate <= 0:
+    examined = db["scanned_objects_per_sec"]
+    returned = db["docs_returned_per_sec"]
+    if examined <= 0:
         return None
-    ratio = (scanned_rate / query_rate) if query_rate > 0 else float("inf")
-    if ratio > HIGH_SCAN_RATIO:
-        ratio_text = f"{ratio:.1f}x" if ratio != float("inf") else "query rate ~0 despite scanning"
+    ratio = examined / returned if returned > 0 else float("inf")
+    if ratio <= HIGH_SCAN_RATIO:
+        return None
+    ratio_text = f"{ratio:.1f}x" if returned > 0 else "documents examined with ~0 returned"
+    return {
+        "signal": "cpu_vs_scan_efficiency",
+        "kind": AGREES,
+        "note": (
+            f"Atlas CPU trigger AND documents examined per document returned is {ratio_text} "
+            f"({examined}/sec examined vs {returned}/sec returned) — likely missing or poor "
+            f"indexes rather than undersized compute. Recommend an index review (Atlas "
+            f"Performance Advisor or explain()) BEFORE a tier bump — it's the cheaper fix, and "
+            f"scaling up would mask the real problem while costing more every month."
+        ),
+    }
+
+
+def analyze_memory(reasons, db, data_footprint, window_label):
+    """Total data size vs configured cache. All data fitting in cache is decisive (the cache can't
+    be the pressure); data exceeding the cache is not — only the hot subset has to fit, so that
+    case is reported as context with the cache read-in rate, not as confirmation."""
+    if not (fired(reasons, TRIGGER_KEYWORDS["memory"]) or fired(reasons, TRIGGER_KEYWORDS["cache_fill"])):
+        return None
+    if not db["wt_available"]:
         return {
-            "signal": "cpu_vs_scan_efficiency",
-            "note": (
-                f"Atlas CPU p95 > 80% AND scanned/query ratio is {ratio_text} "
-                f"(scanned {scanned_rate}/sec vs {query_rate}/sec queries) — root cause is likely "
-                f"missing/poor indexes, not undersized compute. Recommend an index review "
-                f"(Atlas Performance Advisor or explain()) BEFORE a tier bump — it's the cheaper "
-                f"fix, and scaling up would mask the real problem while costing more every month."
-            ),
-            "lead_with_schema_fix": True,
+            "signal": "memory_no_wt_data",
+            "kind": CONTEXT,
+            "note": (f"Atlas flagged memory/cache pressure, but db_diagnostics.py connected to "
+                     f"{db['process']} ({db['host']}), which has no WiredTiger cache — run it "
+                     f"against a shard member to compare data size with cache size."),
         }
-    return None
-
-
-def analyze_memory(reasons, db_summary):
-    """
-    Gate primarily on working_set > wt_cache_bytes_max — that's the decisive, direct evidence
-    that the cache structurally cannot hold the working set, regardless of the current instantaneous
-    fill percentage. wt_cache_pct_used is corroborating detail, not a strict co-requirement: this
-    project's own db_diagnostics.py run against a real M10 cluster found wt_cache_pct_used=77.5%
-    (well under an initial WT_CACHE_NEAR_FULL_PCT=90% co-requirement this function used to have)
-    alongside a working set 18x larger than the configured cache — a genuinely decisive, high-
-    confidence scale-up case that an AND-gated "near 100%" requirement would have missed entirely.
-    Caught by testing this function against real data before trusting it, not by inspection alone.
-    """
-    mem_or_cache_fired = fired(reasons, TRIGGER_KEYWORDS["memory"]) or fired(reasons, TRIGGER_KEYWORDS["cache_fill"])
-    if not mem_or_cache_fired or not db_summary:
-        return None
-    wt_pct = db_summary.get("wt_cache_pct_used")
-    ws_bytes = working_set_bytes(db_summary.get("_working_set_ref", {}))
-    cache_max = db_summary.get("wt_cache_bytes_max")
-    if wt_pct is None:
-        return None
-    if ws_bytes and cache_max and ws_bytes > cache_max:
-        oversubscribed_x = ws_bytes / cache_max
-        return {
-            "signal": "memory_confirmed",
-            "note": (
-                f"Atlas memory/cache-fill signal AND db-internal working set ({ws_bytes:,} bytes) "
-                f"exceeds the configured WT cache ({cache_max:,} bytes) by {oversubscribed_x:.1f}x "
-                f"(current cache fill: {wt_pct}%) — working set genuinely doesn't fit in RAM at "
-                f"the current tier. This is a real memory-driven scale-up case, not noise. "
-                f"Confidence: HIGH."
-            ),
-            "confidence_override": "high",
-        }
-    elif ws_bytes and cache_max and ws_bytes <= cache_max and wt_pct < WT_CACHE_MODERATE_PCT:
+    data_bytes = total_data_bytes(data_footprint)
+    cache_max = db["wt_cache_bytes_max"]
+    wt_pct = db["wt_cache_pct_used"]
+    if data_bytes <= cache_max and wt_pct < WT_CACHE_MODERATE_PCT:
         return {
             "signal": "memory_unconfirmed",
+            "kind": DISAGREES,
             "note": (
-                f"Atlas flagged low free memory / cache pressure, but db-internal "
-                f"wt_cache_pct_used={wt_pct}% is moderate and the working set ({ws_bytes:,} bytes) "
-                f"fits under the configured WT cache ({cache_max:,} bytes). The OS-level memory "
-                f"pressure Atlas is seeing likely isn't coming from WiredTiger — could be another "
-                f"process, normal OS page-cache behavior, or a short spike. LOWER confidence on a "
-                f"memory-driven scale-up; don't recommend one from the Atlas signal alone."
+                f"Atlas flagged low free memory / cache pressure, but ALL data + indexes "
+                f"({data_bytes:,} bytes) fit in the configured WT cache ({cache_max:,} bytes) and "
+                f"wt_cache_pct_used={wt_pct}%. The OS-level memory pressure likely isn't coming "
+                f"from WiredTiger — another process, normal OS page-cache behavior, or a short "
+                f"spike. Don't recommend a memory-driven scale-up from the Atlas signal alone."
             ),
-            "confidence_override": "low",
+        }
+    if data_bytes > cache_max:
+        return {
+            "signal": "memory_data_exceeds_cache",
+            "kind": CONTEXT,
+            "note": (
+                f"Total data + indexes ({data_bytes:,} bytes) is {data_bytes / cache_max:.1f}x the "
+                f"configured WT cache ({cache_max:,} bytes); cache fill {wt_pct}%, "
+                f"{db['wt_pages_read_into_cache_per_sec']} pages/sec read into cache during the "
+                f"sample. That's an upper bound on the working set, not the working set — it "
+                f"only confirms memory pressure if pages are being read in continuously. Compare "
+                f"with the page-fault and cache-read rows in the Atlas table before deciding."
+            ),
         }
     return None
 
 
-def analyze_connections(reasons, db_summary):
+def analyze_connections(reasons, db, window_label):
     atlas_fired = fired(reasons, TRIGGER_KEYWORDS["connections"])
-    if not db_summary:
-        return None
-    db_pct = db_summary.get("connections_pct_used")
-    if db_pct is None:
-        return None
+    db_pct = db["connections_pct_used"]
     db_near_limit = db_pct > 60
     if atlas_fired and db_near_limit:
         return {
             "signal": "connections_agree",
+            "kind": AGREES,
             "note": (
                 f"Atlas connections trigger AND db-internal connections_pct_used={db_pct}% agree "
                 f"— real connection pressure, likely a connection-pooling problem in the "
@@ -175,70 +162,72 @@ def analyze_connections(reasons, db_summary):
     if atlas_fired and not db_near_limit:
         return {
             "signal": "connections_disagree",
+            "kind": DISAGREES,
             "note": (
-                f"DISAGREEMENT: Atlas flagged connections pressure, but db-internal "
+                f"Atlas flagged connections pressure over {window_label}, but db-internal "
                 f"connections_pct_used is only {db_pct}% right now. Possible causes: different "
                 f"sampling windows, or a spike that's since resolved. Showing both numbers rather "
-                f"than picking one — don't treat this as a confirmed connections problem without "
-                f"checking the Atlas connections chart for when the spike occurred."
+                f"than picking one — check the Atlas connections chart for when the spike occurred."
             ),
         }
     if not atlas_fired and db_near_limit:
         return {
             "signal": "connections_disagree",
+            "kind": DISAGREES,
             "note": (
-                f"DISAGREEMENT: db-internal connections_pct_used={db_pct}% is elevated right now, "
-                f"but Atlas's 7-day p95 didn't cross the trigger. This snapshot may be catching a "
-                f"spike the wider Atlas window smoothed out — worth a closer look at recent "
+                f"db-internal connections_pct_used={db_pct}% is elevated right now, but Atlas's "
+                f"p95 over {window_label} didn't cross the trigger. This snapshot may be catching "
+                f"a spike the wider Atlas window smoothed out — worth a closer look at recent "
                 f"connection counts rather than dismissing it."
             ),
         }
     return None
 
 
-def analyze_disk(reasons, db_summary):
-    disk_fired = fired(reasons, TRIGGER_KEYWORDS["iops"]) or fired(reasons, TRIGGER_KEYWORDS["latency"])
-    if not disk_fired or not db_summary:
+def analyze_disk(reasons, db, window_label):
+    """Context only: any active cluster reads pages into cache, so a nonzero rate doesn't by
+    itself show cache misses are driving the disk signal."""
+    if not (fired(reasons, TRIGGER_KEYWORDS["iops"]) or fired(reasons, TRIGGER_KEYWORDS["latency"])):
         return None
-    read_into_rate = db_summary.get("wt_pages_read_into_cache_per_sec")
-    if read_into_rate and read_into_rate > 0:
-        return {
-            "signal": "disk_cache_miss_driven",
-            "note": (
-                f"Atlas disk IOPS/latency signal AND db-internal "
-                f"wt_pages_read_into_cache_per_sec={read_into_rate}/sec — cache misses are driving "
-                f"disk reads. This points at working-set-vs-cache-size (see memory analysis above "
-                f"if present) rather than pure write volume; reinforces or explains the disk signal."
-            ),
-        }
-    return None
+    if not db["wt_available"]:
+        return None
+    return {
+        "signal": "disk_cache_read_in",
+        "kind": CONTEXT,
+        "note": (
+            f"Atlas disk IOPS/latency signal; db-internal wt_pages_read_into_cache_per_sec="
+            f"{db['wt_pages_read_into_cache_per_sec']}/sec during the sample. If that's a large "
+            f"share of read IOPS, cache misses (working set vs cache size) are driving disk reads "
+            f"rather than write volume — see the memory analysis if present."
+        ),
+    }
 
 
-def analyze_result(result, db_diagnostics):
+def analyze_result(result, db_diagnostics, window_label):
     """Run all combination rules for one rightsizing result (one cluster or shard)."""
-    reasons = result.get("reasons", [])
-    db_summary = None
-    if db_diagnostics:
-        db_summary = dict(db_diagnostics.get("server_status_summary", {}))
-        db_summary["_working_set_ref"] = db_diagnostics.get("working_set", {})
-
-    notes = []
-    for analyzer in (analyze_cpu, analyze_memory, analyze_connections, analyze_disk):
-        finding = analyzer(reasons, db_summary)
-        if finding:
-            notes.append(finding)
-    return notes
+    if result["verdict"] not in EVALUATED_VERDICTS:
+        return []
+    reasons = result["reasons"]
+    db = db_diagnostics["server_status_summary"]
+    findings = [
+        analyze_cpu(reasons, db, window_label),
+        analyze_memory(reasons, db, db_diagnostics["data_footprint"], window_label),
+        analyze_connections(reasons, db, window_label),
+        analyze_disk(reasons, db, window_label),
+    ]
+    return [f for f in findings if f]
 
 
 def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path):
+    window_label = rightsizing_report["windowLabel"]
     lines = ["# Merged Rightsizing + DB Diagnostics Report", ""]
-    lines.append(f"Project: `{rightsizing_report.get('groupId')}`  |  "
-                 f"Lookback: {rightsizing_report.get('windowLabel', rightsizing_report.get('windowDays'))}  |  "
+    lines.append(f"Project: `{rightsizing_report['groupId']}`  |  "
+                 f"Lookback: {window_label}  |  "
                  f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
     lines.append("")
 
-    results = rightsizing_report.get("results", [])
-    multi_shard = len([r for r in results if r.get("verdict") != "not_applicable"]) > 1
+    results = rightsizing_report["results"]
+    multi_shard = len([r for r in results if r["verdict"] in EVALUATED_VERDICTS]) > 1
 
     if not db_diagnostics:
         lines.append("**Mode: ATLAS-ONLY** — no `--db-diagnostics` file provided. The verdicts "
@@ -249,8 +238,11 @@ def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path)
                       "\"buy a bigger cluster\") — see references/db-diagnostics.md.")
         lines.append("")
     else:
+        db = db_diagnostics["server_status_summary"]
         lines.append(f"**Mode: COMBINED** — merged with `{db_diagnostics_path}` "
-                      f"(sampled {db_diagnostics.get('sampled_at', 'unknown time')}).")
+                      f"(sampled {db_diagnostics['sampled_at']} from {db['process']} on "
+                      f"`{db['host']}`). Nothing ties that file to this report's cluster — "
+                      f"make sure it was run against the same one.")
         if multi_shard:
             lines.append("")
             lines.append("**WARNING:** This rightsizing report covers **more than one shard/replica set**, "
@@ -267,20 +259,19 @@ def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path)
         lines.append(f"**Atlas verdict: {r['verdict'].replace('_', ' ').upper()}**  "
                       f"(confidence: {r['confidence']})")
         lines.append("")
-        for reason in r.get("reasons", []):
+        for reason in r["reasons"]:
             lines.append(f"- {reason}")
         lines.append("")
 
         if db_diagnostics:
-            combined_notes = analyze_result(r, db_diagnostics)
+            combined_notes = analyze_result(r, db_diagnostics, window_label)
             if combined_notes:
                 lines.append("**Combined analysis (Atlas + DB-internal):**")
                 lines.append("")
                 for note in combined_notes:
-                    prefix = "[DISAGREEMENT] " if "DISAGREEMENT" in note["note"] else "[AGREES] "
-                    lines.append(f"{prefix}{note['note']}")
+                    lines.append(f"[{note['kind'].upper()}] {note['note']}")
                     lines.append("")
-            elif r.get("verdict") in ("scale_up", "change_disk_or_iops"):
+            elif r["verdict"] in ("scale_up", "change_disk_or_iops"):
                 lines.append("*No db-internal signal corroborated or contradicted this verdict — "
                               "the Atlas-only reasoning above stands on its own.*")
                 lines.append("")
@@ -300,14 +291,12 @@ def main():
     ap.add_argument("--out-dir", default="./rightsizing-report")
     args = ap.parse_args()
 
+    for path in (args.rightsizing_report, args.db_diagnostics):
+        if path and not os.path.isfile(path):
+            ap.error(f"file not found: {path}")
     rightsizing_report = load_json(args.rightsizing_report)
-    if rightsizing_report is None:
-        raise SystemExit(f"Could not read rightsizing report: {args.rightsizing_report}")
-
+    # Atlas-only mode is chosen by omitting --db-diagnostics, never by a path that can't be read.
     db_diagnostics = load_json(args.db_diagnostics) if args.db_diagnostics else None
-    if args.db_diagnostics and db_diagnostics is None:
-        print(f"WARNING: --db-diagnostics path given but not found/readable: {args.db_diagnostics} "
-              f"— continuing in Atlas-only mode.")
 
     merged_md = build_merged_report(rightsizing_report, db_diagnostics, args.db_diagnostics)
 
@@ -316,11 +305,12 @@ def main():
         f.write(merged_md)
     with open(os.path.join(args.out_dir, "merged_report.json"), "w", encoding="utf-8") as f:
         json.dump({
-            "groupId": rightsizing_report.get("groupId"),
+            "groupId": rightsizing_report["groupId"],
             "mode": "combined" if db_diagnostics else "atlas_only",
             "results": [
-                {**r, "combined_analysis": analyze_result(r, db_diagnostics) if db_diagnostics else []}
-                for r in rightsizing_report.get("results", [])
+                {**r, "combined_analysis": (analyze_result(r, db_diagnostics, rightsizing_report["windowLabel"])
+                                            if db_diagnostics else [])}
+                for r in rightsizing_report["results"]
             ],
         }, f, indent=2)
 
