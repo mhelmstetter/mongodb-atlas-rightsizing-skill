@@ -1,0 +1,16 @@
+{
+  "groupId": "615cb203e1f78b1d52c36fb6",
+  "days": 7,
+  "results": [
+    {
+      "cluster": "Cluster0",
+      "current_tier": "M10",
+      "verdict": "no_change",
+      "reasons": [
+        "No thresholds crossed; metrics are in the comfortable mid-range"
+      ],
+      "confidence": "high",
+      "metric_summary": {}
+    }
+  ]
+}
