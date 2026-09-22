@@ -232,10 +232,13 @@ def cluster_host_pattern(cluster_cfg):
     standard = cluster_cfg["connectionStrings"]["standard"]
     first_host = standard.split("://", 1)[1].split("/", 1)[0].split(",")[0].split(":")[0]
     label, domain = first_host.split(".", 1)
-    if "-shard-" not in label:
+    # Sharded clusters with an embedded config server list the config hosts (mongos on 27016)
+    # first, so the first host can be either form.
+    m = re.match(r"^(.+)-(shard|config)-\d+-\d+$", label)
+    if not m:
         sys.exit(f"Unexpected host label '{label}' in connection string for cluster "
-                 f"{cluster_cfg['name']}; expected '<prefix>-shard-NN-NN'.")
-    prefix = label.rsplit("-shard-", 1)[0]
+                 f"{cluster_cfg['name']}; expected '<prefix>-shard-NN-NN' or '<prefix>-config-NN-NN'.")
+    prefix = m.group(1)
     return re.compile(HOST_LABEL_RE.format(prefix=re.escape(prefix))), domain
 
 
