@@ -25,7 +25,7 @@ window) instead — see `rightsizing.py`'s `main()`.
 |---|---|
 | `SYSTEM_NORMALIZED_CPU_USER` | CPU usage normalized against the instance's tier — the right signal for cross-tier scale-up/down comparisons (raw `SYSTEM_CPU_USER` isn't comparable across tiers). |
 | `SYSTEM_NORMALIZED_CPU_KERNEL` | Kernel-time CPU; sustained high values alongside high IOPS often means the box is disk/interrupt-bound, not just query-load-bound. |
-| `SYSTEM_MEMORY_USED` / `SYSTEM_MEMORY_FREE` | Working-set pressure. Low free memory alone is a weaker signal than it looks (see `EXTRA_INFO_PAGE_FAULTS` below) — it's often just Linux using spare RAM for filesystem page cache. |
+| `SYSTEM_MEMORY_USED` / `FREE` / `CACHED` / `BUFFERS` / `AVAILABLE` | Working-set pressure. Low free memory alone is a weaker signal than it looks (see `EXTRA_INFO_PAGE_FAULTS` below) — it's often just Linux using spare RAM for filesystem page cache. |
 | `CONNECTIONS` | Compare against the tier's max-connections limit (`TIER_MAX_CONNECTIONS`); consistently near the ceiling is its own scale-up trigger regardless of CPU/memory. |
 | `TICKETS_AVAILABLE_READS` / `TICKETS_AVAILABLE_WRITE` | WiredTiger concurrency tickets — pulled for **context only**, not a trigger (see `references/thresholds.md` "Concurrency queuing" for why the old ticket-count trigger was removed). Note the Atlas API naming quirk: `READS` is plural, `WRITE` is singular. |
 | `GLOBAL_LOCK_CURRENT_QUEUE_READERS` / `WRITERS` | The real concurrency-pressure trigger: operations actually queued waiting for a slot right now, not just a low ticket count. |
@@ -36,8 +36,10 @@ window) instead — see `rightsizing.py`'s `main()`.
 | `SYSTEM_NORMALIZED_CPU_IOWAIT` | Context only — corroborates disk-latency findings with actual CPU stall time. |
 
 Derived per data point (before percentiles, since a sum of percentiles isn't the percentile of
-the sum): `SYSTEM_NORMALIZED_CPU_TOTAL` (user + kernel) and `SYSTEM_MEMORY_FREE_PERCENT`
-(free / (free + used)).
+the sum): `SYSTEM_NORMALIZED_CPU_TOTAL` (user + kernel) and `SYSTEM_MEMORY_AVAILABLE_PERCENT`
+(available / (used + free + cached + buffers)). Those four sum to physical RAM (verified on live
+M40/M60 nodes: 15.6 / 62.8 GiB). `SYSTEM_MEMORY_FREE` excludes the page cache, so a busy mongod
+shows ~3% free while ~44% is actually available — `SYSTEM_MEMORY_AVAILABLE` is the pressure signal.
 
 ## Disk-level metrics (`DISK_METRICS` in `rightsizing.py`)
 

@@ -50,6 +50,12 @@ HOST_METRICS = [
     "SYSTEM_NORMALIZED_CPU_KERNEL",
     "SYSTEM_MEMORY_USED",
     "SYSTEM_MEMORY_FREE",
+    # used + free + cached + buffers = physical RAM (verified on live M40/M60 nodes). FREE alone
+    # excludes the page cache, so it's always low on a busy mongod; AVAILABLE includes the
+    # reclaimable part and is the pressure signal.
+    "SYSTEM_MEMORY_CACHED",
+    "SYSTEM_MEMORY_BUFFERS",
+    "SYSTEM_MEMORY_AVAILABLE",
     "CONNECTIONS",
     "TICKETS_AVAILABLE_READS",   # context only — NOT a trigger, see evaluate_cluster() for why
     "TICKETS_AVAILABLE_WRITE",  # NB: singular "WRITE", unlike the plural "READS" — an Atlas API quirk
@@ -103,7 +109,7 @@ ROUTER_METRICS = [
 # result falls through to "no thresholds crossed".
 CORE_METRICS = [
     "SYSTEM_NORMALIZED_CPU_TOTAL",   # derived: user + kernel per data point
-    "SYSTEM_MEMORY_FREE_PERCENT",    # derived: free / (free + used) per data point
+    "SYSTEM_MEMORY_AVAILABLE_PERCENT",  # derived: available / (used + free + cached + buffers)
     "CONNECTIONS",
     "DISK_PARTITION_IOPS_TOTAL",     # derived: read + write per data point
     "DISK_PARTITION_SPACE_PERCENT_USED",
@@ -293,12 +299,12 @@ def _fetch_measurements(session, path, metric_names, period, granularity):
     return out
 
 
-def _combine(series_a, series_b, fn, label):
-    """Point-by-point combination of two series from the same response (same timestamps). A point
-    is None if either input is None."""
-    if len(series_a) != len(series_b):
-        sys.exit(f"Cannot combine {label}: series lengths differ ({len(series_a)} vs {len(series_b)}).")
-    return [None if a is None or b is None else fn(a, b) for a, b in zip(series_a, series_b)]
+def _combine(fn, label, *series):
+    """Point-by-point combination of series from the same response (same timestamps). A point is
+    None if any input is None."""
+    if len({len(s) for s in series}) != 1:
+        sys.exit(f"Cannot combine {label}: series lengths differ ({[len(s) for s in series]}).")
+    return [None if None in point else fn(*point) for point in zip(*series)]
 
 
 def get_measurements(session, group_id, process_id, period, granularity):
@@ -309,11 +315,12 @@ def get_measurements(session, group_id, process_id, period, granularity):
     # Derived series, computed per data point before any percentile is taken (a sum or ratio of
     # percentiles isn't the percentile of the sum or ratio).
     out["SYSTEM_NORMALIZED_CPU_TOTAL"] = _combine(
-        out["SYSTEM_NORMALIZED_CPU_USER"], out["SYSTEM_NORMALIZED_CPU_KERNEL"],
-        lambda u, k: u + k, "CPU user+kernel")
-    out["SYSTEM_MEMORY_FREE_PERCENT"] = _combine(
-        out["SYSTEM_MEMORY_FREE"], out["SYSTEM_MEMORY_USED"],
-        lambda f, u: 100 * f / (f + u), "memory free/(free+used)")
+        lambda u, k: u + k, "CPU user+kernel",
+        out["SYSTEM_NORMALIZED_CPU_USER"], out["SYSTEM_NORMALIZED_CPU_KERNEL"])
+    out["SYSTEM_MEMORY_AVAILABLE_PERCENT"] = _combine(
+        lambda a, u, f, c, b: 100 * a / (u + f + c + b), "memory available/total",
+        out["SYSTEM_MEMORY_AVAILABLE"], out["SYSTEM_MEMORY_USED"], out["SYSTEM_MEMORY_FREE"],
+        out["SYSTEM_MEMORY_CACHED"], out["SYSTEM_MEMORY_BUFFERS"])
 
     # Disk metrics live under a per-partition sub-resource, not the process-level endpoint.
     disks = api_get(session, f"/groups/{group_id}/processes/{process_id}/disks")
@@ -325,8 +332,8 @@ def get_measurements(session, group_id, process_id, period, granularity):
         )
         # Provisioned IOPS is one budget shared by reads and writes.
         disk_out["DISK_PARTITION_IOPS_TOTAL"] = _combine(
-            disk_out["DISK_PARTITION_IOPS_READ"], disk_out["DISK_PARTITION_IOPS_WRITE"],
-            lambda r, w: r + w, f"IOPS read+write on {name}")
+            lambda r, w: r + w, f"IOPS read+write on {name}",
+            disk_out["DISK_PARTITION_IOPS_READ"], disk_out["DISK_PARTITION_IOPS_WRITE"])
         for k, v in disk_out.items():
             out.setdefault(k, []).extend(v)
 
@@ -407,10 +414,10 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     if exceeds("CPU (user+kernel) p95", cpu["p95"], 80):
         up.append(("cpu", f"CPU p95 {cpu['p95']}% (user+kernel) > 80% threshold"))
 
-    # Free memory is low-is-bad, so the tail that matters is the bottom one: p5, not p95.
-    mem_free_pct = summary["SYSTEM_MEMORY_FREE_PERCENT"]
-    if exceeds("Free memory p5", mem_free_pct["p5"], 10, above=False):
-        up.append(("memory", f"Free memory p5 {mem_free_pct['p5']}% < 10% of total"))
+    # Available memory is low-is-bad, so the tail that matters is the bottom one: p5, not p95.
+    mem_avail_pct = summary["SYSTEM_MEMORY_AVAILABLE_PERCENT"]
+    if exceeds("Available memory p5", mem_avail_pct["p5"], 10, above=False):
+        up.append(("memory", f"Available memory p5 {mem_avail_pct['p5']}% < 10% of total"))
 
     # thresholds.md has documented this trigger since early in this script's history, but it was
     # never actually implemented — CONNECTIONS was pulled into the report table with no threshold
@@ -500,23 +507,21 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
                    f"undersized for the working set{corroboration}"))
 
     # WiredTiger eviction thresholds (see references/thresholds.md "WiredTiger eviction thresholds").
-    # eviction_target/eviction_dirty_target (80%/5%) are the point where WT's *background* eviction
-    # threads start working to bring usage back down — not yet the harder eviction_trigger/
-    # eviction_dirty_trigger (95%/20%) point where application threads get recruited to evict. Using
-    # the target (not trigger) values here means this fires earlier/more sensitively, on the
-    # assumption that sustained background-eviction pressure is itself worth flagging before it
-    # escalates to the fully pressured state.
+    # These trigger at eviction_trigger/eviction_dirty_trigger (95%/20%), where application threads
+    # get recruited to evict and reads/writes stall. Not at eviction_target (80%/5%): WT holds a
+    # full cache at the target by design, so on a live project every node of every cluster whose
+    # data exceeds its cache sat at a cache-fill p95 of 80.0x and fired.
     cache_fill = summary.get("CACHE_FILL_RATIO")
-    if cache_fill and exceeds("Cache fill ratio p95", cache_fill["p95"], 80):
+    if cache_fill and exceeds("Cache fill ratio p95", cache_fill["p95"], 95):
         up.append(("cache_fill",
-                   f"Cache fill ratio p95 {cache_fill['p95']}% > 80% (eviction_target) — "
-                   f"background eviction likely running continuously"))
+                   f"Cache fill ratio p95 {cache_fill['p95']}% > 95% (eviction_trigger) — "
+                   f"application threads are being recruited to evict, stalling operations"))
 
     dirty_fill = summary.get("DIRTY_FILL_RATIO")
-    if dirty_fill and exceeds("Dirty fill ratio p95", dirty_fill["p95"], 5):
+    if dirty_fill and exceeds("Dirty fill ratio p95", dirty_fill["p95"], 20):
         up.append(("dirty_fill",
-                   f"Dirty fill ratio p95 {dirty_fill['p95']}% > 5% (eviction_dirty_target) — "
-                   f"dirty-page eviction likely running continuously"))
+                   f"Dirty fill ratio p95 {dirty_fill['p95']}% > 20% (eviction_dirty_trigger) — "
+                   f"application threads are being recruited to evict dirty pages"))
 
     latency_r = summary.get("DISK_PARTITION_LATENCY_READ")
     latency_w = summary.get("DISK_PARTITION_LATENCY_WRITE")
@@ -527,7 +532,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
 
     down_ok = (
         cpu["p95"] < 20
-        and mem_free_pct["p5"] > 40
+        and mem_avail_pct["p5"] > 40
         and space_used["p95"] < 50
         and provisioned is not None and iops["p95"] < 0.5 * provisioned
         and max_conns is not None and conns["p95"] < 0.3 * max_conns

@@ -10,15 +10,15 @@ headroom than these defaults leave.
 | Signal | Threshold | Window |
 |---|---|---|
 | Normalized CPU (user+kernel) | p95 > 80% | sustained across ≥ 3 of the last 7 days |
-| Memory | free memory p5 < 10% of total (free/(free+used) per data point; low-is-bad, so the bottom tail) | last 7 days |
+| Memory | available memory p5 < 10% of total RAM (`SYSTEM_MEMORY_AVAILABLE` / (used+free+cached+buffers) per data point; low-is-bad, so the bottom tail) | last 7 days |
 | Disk IOPS | read+write p95 > 90% of provisioned IOPS (one shared budget) | sustained across ≥ 3 of the last 7 days |
 | Disk space used | p95 > 90% of capacity (NOT I/O saturation — see below) | sustained across ≥ 3 of the last 7 days |
 | Disk latency | read or write p95 > 15ms (heuristic, see below) | last 7 days |
 | Connections | p95 > 80% of tier's max connections | last 7 days |
 | Concurrency queuing | read or write queue depth p95 > 0 ops (see below — NOT ticket count) | last 7 days |
 | Page faults | p95 > 1.0/sec (heuristic, see below) | last 7 days |
-| Cache fill ratio | p95 > 80% (WT `eviction_target`, see below) | last 7 days |
-| Dirty fill ratio | p95 > 5% (WT `eviction_dirty_target`, see below) | last 7 days |
+| Cache fill ratio | p95 > 95% (WT `eviction_trigger`, see below) | last 7 days |
+| Dirty fill ratio | p95 > 20% (WT `eviction_dirty_trigger`, see below) | last 7 days |
 
 If multiple signals fire together (e.g. CPU + IOPS), say so explicitly — it changes the fix
 (compute tier bump vs. IOPS bump vs. both) and a single-signal trigger deserves less confidence
@@ -114,12 +114,11 @@ WiredTiger has four built-in eviction thresholds, as percentages of the *configu
 | `eviction_dirty_target` | 5% | Background eviction starts working on dirty (not-yet-checkpointed) pages |
 | `eviction_dirty_trigger` | 20% | **Pressured state**: application threads are recruited to evict dirty pages specifically — more expensive than clean-page eviction since it requires a disk write |
 
-The script triggers on the `_target` values (80% / 5%), not the harder `_trigger` values (95% /
-20%). This is a deliberate choice to flag sustained *background* eviction pressure before it
-escalates to the fully pressured, application-thread-stalling state — it will fire earlier and
-more often than a trigger-based threshold would. If false positives become a problem for a
-particular workload, consider moving these to the `_trigger` values instead (95% / 20%) for a
-more conservative (later, less sensitive) signal.
+The script triggers on the `_trigger` values (95% / 20%), where application threads are recruited
+to evict and operations stall. It used to trigger on the `_target` values (80% / 5%), but WiredTiger
+holds a full cache at `eviction_target` by design: on a live project, every node of every cluster
+whose data exceeds its cache showed a cache-fill p95 of 80.0x and fired, whether or not anything
+was stalling.
 
 `CACHE_FILL_RATIO` and `DIRTY_FILL_RATIO` from the Atlas Admin API report `units: PERCENT` as
 already-scaled 0–100 values (e.g. a reading of `78.3` means 78.3%) — **do not** multiply by 100.
@@ -127,7 +126,7 @@ already-scaled 0–100 values (e.g. a reading of `78.3` means 78.3%) — **do no
 ## Scale DOWN candidate (requires ALL of the following — this should be a conservative call)
 
 - Normalized CPU p95 < 20% for the entire window, not just average
-- Memory: free memory p5 > 40% of total
+- Memory: available memory p5 > 40% of total RAM
 - Disk space used p95 < 50%, and read+write IOPS p95 < 50% of provisioned IOPS — if the cluster
   config has no provisioned IOPS value, scale-down isn't recommended
 - Connections p95 < 30% of the tier's limit — if the tier isn't in `TIER_MAX_CONNECTIONS`,

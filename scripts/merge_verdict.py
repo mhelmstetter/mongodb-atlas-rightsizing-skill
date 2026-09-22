@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # rightsizing.py's reason text changes without updating this list to match).
 TRIGGER_KEYWORDS = {
     "cpu": "CPU p95",
-    "memory": "Free memory p5",
+    "memory": "Available memory p5",
     "cache_fill": "Cache fill ratio p95",
     "connections": "Connections p95",
     "iops": "IOPS p95",
