@@ -27,6 +27,7 @@ Only dependency: `requests` (pip install requests).
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -193,25 +194,66 @@ def api_get(session, path, params=None):
         return resp.json()
 
 
+def api_get_all(session, path):
+    """GET every page of a paginated Atlas list endpoint."""
+    results, page = [], 1
+    while True:
+        data = api_get(session, path, params={"itemsPerPage": 500, "pageNum": page})
+        results.extend(data["results"])
+        if len(results) >= data["totalCount"] or not data["results"]:
+            break
+        page += 1
+    if len(results) != data["totalCount"]:
+        sys.exit(f"Atlas reported totalCount={data['totalCount']} on {path} but returned "
+                 f"{len(results)} results across {page} pages.")
+    return results
+
+
 def list_clusters(session, group_id):
-    data = api_get(session, f"/groups/{group_id}/clusters")
-    return data.get("results", [])
+    return api_get_all(session, f"/groups/{group_id}/clusters")
 
 
 def get_cluster(session, group_id, cluster_name):
     return api_get(session, f"/groups/{group_id}/clusters/{cluster_name}")
 
 
-def list_processes_for_cluster(session, group_id, cluster_name):
-    data = api_get(session, f"/groups/{group_id}/processes", params={"itemsPerPage": 500})
-    needle = cluster_name.lower()
-    procs = [
-        p for p in data.get("results", [])
-        if p.get("userAlias", "").lower().startswith(needle)
-        or (p.get("replicaSetName") or "").lower() == needle
-        or needle in p.get("id", "").lower()
-    ]
+# Atlas host labels: <prefix>-shard-<NN>-<NN> for replica-set and shard members (and mongos, on a
+# different port), <prefix>-config-<NN>-<NN> for dedicated config servers.
+HOST_LABEL_RE = r"^{prefix}-(shard|config)-\d+-\d+$"
+
+
+def cluster_host_pattern(cluster_cfg):
+    """Derive (host-label regex, domain) from the cluster's own standard connection string.
+
+    Atlas hostnames don't always start with the cluster name verbatim (it's lowercased and
+    truncated, and gets a suffix on collision), so matching processes by name substring picks up
+    other clusters that share a prefix (`prod` vs `prod-analytics`). The connection string carries
+    the exact host prefix and project domain this cluster's processes use."""
+    standard = cluster_cfg["connectionStrings"]["standard"]
+    first_host = standard.split("://", 1)[1].split("/", 1)[0].split(",")[0].split(":")[0]
+    label, domain = first_host.split(".", 1)
+    if "-shard-" not in label:
+        sys.exit(f"Unexpected host label '{label}' in connection string for cluster "
+                 f"{cluster_cfg['name']}; expected '<prefix>-shard-NN-NN'.")
+    prefix = label.rsplit("-shard-", 1)[0]
+    return re.compile(HOST_LABEL_RE.format(prefix=re.escape(prefix))), domain
+
+
+def list_processes_for_cluster(session, group_id, cluster_cfg):
+    pattern, domain = cluster_host_pattern(cluster_cfg)
+    procs = []
+    for p in api_get_all(session, f"/groups/{group_id}/processes"):
+        label, _, proc_domain = p["userAlias"].partition(".")
+        if proc_domain == domain and pattern.match(label):
+            procs.append(p)
+    if not procs:
+        sys.exit(f"No processes matched cluster {cluster_cfg['name']} (hosts {pattern.pattern} "
+                 f"in {domain}).")
     return procs
+
+
+def node_label(p):
+    return f"{p['userAlias'].split('.', 1)[0]}:{p['port']}"
 
 
 def group_processes_by_replica_set(procs):
@@ -512,38 +554,63 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     return verdict, reasons, confidence, confidence_notes, summary
 
 
+CONFIDENCE_ORDER = ["low", "medium", "high"]
+
+
 def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
-    """Fetch measurements for one group of processes (a shard, a config-server RS, or a whole
-    non-sharded cluster) and run it through evaluate_cluster(). This is the same fetch+evaluate
-    logic main() used to run once per cluster; factored out so it can run once per shard too."""
-    process_metrics = {}
+    """Evaluate one group of processes (a shard, a config-server RS, or a whole non-sharded
+    cluster). Each node is evaluated on its own and the results combined: pooling samples across
+    nodes before taking p95 lets idle secondaries dilute a hot primary (with two idle secondaries
+    the primary is only a third of the samples). Connection limits and provisioned IOPS are
+    per-node ceilings too.
+
+    Group verdict: insufficient_data if any node has it, scale_up if any node needs it,
+    scale_down_candidate only if every node qualifies, otherwise no_change. Confidence is the
+    lowest across nodes."""
+    nodes = {}
     for p in procs:
-        pid = p.get("id")
-        if pid:
-            process_metrics[pid] = get_measurements(session, group_id, pid, period, granularity)
-    return evaluate_cluster(cfg, process_metrics, window_days)
+        metrics = get_measurements(session, group_id, p["id"], period, granularity)
+        nodes[node_label(p)] = evaluate_cluster(cfg, {p["id"]: metrics}, window_days)
+
+    verdicts = {v for v, _, _, _, _ in nodes.values()}
+    if "insufficient_data" in verdicts:
+        verdict = "insufficient_data"
+    elif "scale_up" in verdicts:
+        verdict = "scale_up"
+    elif verdicts == {"scale_down_candidate"}:
+        verdict = "scale_down_candidate"
+    else:
+        verdict = "no_change"
+
+    if verdict in ("insufficient_data", "scale_up"):
+        reasons = [f"{node}: {reason}" for node, (v, node_reasons, _, _, _) in nodes.items()
+                   if v == verdict for reason in node_reasons]
+    elif verdict == "scale_down_candidate":
+        reasons = ["CPU, memory, and disk all comfortably under scale-down thresholds on every node"]
+    else:
+        reasons = ["No thresholds crossed on any node; metrics are in the comfortable mid-range"]
+
+    confidence = min((c for _, _, c, _, _ in nodes.values()), key=CONFIDENCE_ORDER.index)
+    confidence_notes = [f"{node}: {note}" for node, (_, _, _, notes, _) in nodes.items() for note in notes]
+    summary = {node: node_summary for node, (_, _, _, _, node_summary) in nodes.items()}
+    return verdict, reasons, confidence, confidence_notes, summary
 
 
 def evaluate_router_group(session, group_id, procs, period, granularity):
     """mongos routers have no local storage or WiredTiger cache, so the scale-up/down thresholds
     in evaluate_cluster() (disk, tickets, cache fill, etc.) don't apply to them — evaluating a
     router's CPU/connections against the same rules would conflate router capacity with shard
-    capacity. Report their host-level metrics for visibility, but skip a scored verdict entirely.
+    capacity. Report their host-level metrics per router for visibility, but skip a scored verdict.
 
     NOT verified against a live sharded cluster — see group_processes_by_replica_set()'s docstring.
     """
-    agg = {}
+    summary = {}
     for p in procs:
-        pid = p.get("id")
-        if not pid:
-            continue
         m = _fetch_measurements(
-            session, f"/groups/{group_id}/processes/{pid}/measurements",
+            session, f"/groups/{group_id}/processes/{p['id']}/measurements",
             ROUTER_METRICS, period, granularity,
         )
-        for name, values in m.items():
-            agg.setdefault(name, []).extend(values)
-    summary = {name: summarize(vals) for name, vals in agg.items()}
+        summary[node_label(p)] = {name: summarize(vals) for name, vals in m.items()}
     return summary
 
 
@@ -563,15 +630,22 @@ def build_report(group_id, results, window_label):
             for note in r["confidence_notes"]:
                 lines.append(f"- {note}")
             lines.append("")
-        lines.append("| Metric | p50 | p95 | max | samples | coverage |")
-        lines.append("|---|---|---|---|---|---|")
-        for name, s in r["metric_summary"].items():
-            if s:
-                lines.append(f"| {name} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} | "
-                             f"{s['coverage']:.0%} |")
-            else:
-                lines.append(f"| {name} | — | — | — | 0 | 0% |")
-        lines.append("")
+        nodes = list(r["metric_summary"])
+        if nodes:
+            lines.append("Per node — p50 / p95 / max (coverage):")
+            lines.append("")
+            lines.append("| Metric | " + " | ".join(nodes) + " |")
+            lines.append("|---|" + "---|" * len(nodes))
+            metric_names = list(dict.fromkeys(
+                name for node in nodes for name in r["metric_summary"][node]))
+            for name in metric_names:
+                cells = []
+                for node in nodes:
+                    s = r["metric_summary"][node].get(name)
+                    cells.append(f"{s['p50']} / {s['p95']} / {s['max']} ({s['coverage']:.0%})"
+                                 if s else "no data")
+                lines.append(f"| {name} | " + " | ".join(cells) + " |")
+            lines.append("")
     lines.append("---")
     lines.append("This is a read-only recommendation. No cluster was modified. Verify thresholds")
     lines.append("against your own risk tolerance before acting — see references/thresholds.md.")
@@ -669,12 +743,20 @@ def main():
         else:
             provisioned_iops = None
 
-        procs = list_processes_for_cluster(session, args.group_id, name)
+        if cfg["paused"]:
+            results.append({
+                "cluster": name, "current_tier": tier_display, "verdict": "paused",
+                "reasons": ["Cluster is paused — no processes to measure. Resume it and re-run."],
+                "confidence": "n/a", "confidence_notes": [], "metric_summary": {},
+            })
+            continue
+
+        procs = list_processes_for_cluster(session, args.group_id, cfg)
         shard_groups, routers = group_processes_by_replica_set(procs)
 
-        if len(shard_groups) <= 1 and not routers:
-            # Plain replica set (or nothing matched at all) — unchanged, single-result behavior.
-            group_procs = next(iter(shard_groups.values()), [])
+        if len(shard_groups) == 1 and not routers:
+            # Plain replica set — a single result.
+            group_procs = next(iter(shard_groups.values()))
             cfg["_provisioned_iops"] = provisioned_iops
             cfg["_max_connections"] = max_connections
             verdict, reasons, confidence, confidence_notes, summary = evaluate_process_group(

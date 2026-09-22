@@ -48,12 +48,17 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
 3. **What the script does** (for each target cluster):
    - Fetches cluster config: `GET /groups/{groupId}/clusters/{clusterName}` — current tier,
      disk size, provisioned IOPS, whether autoscaling is on.
-   - Fetches the process list for the cluster: `GET /groups/{groupId}/processes` (filtered by
-     cluster name) to get each node's `processId` (host:port) and type (primary/secondary/analytics).
+   - Fetches the process list for the cluster: `GET /groups/{groupId}/processes` (all pages),
+     keeping only processes whose host matches the host prefix and domain in the cluster's own
+     `connectionStrings.standard` (`<prefix>-shard-NN-NN` / `<prefix>-config-NN-NN`), so clusters
+     that share a name prefix (`prod` / `prod-analytics`) aren't mixed. Exits if nothing matches;
+     paused clusters are reported as `paused`.
    - Fetches measurements per process: `GET /groups/{groupId}/processes/{processId}/measurements`
      with `granularity=PT1H` and `period=P{days}D`, for the metric set in
      `references/metrics.md`.
-   - Computes p50/p95/max for each metric across the window, per node and cluster-wide.
+   - Computes p50/p95/max and data coverage for each metric across the window, per node, and
+     evaluates each node on its own. A replica set's (or shard's) verdict is the worst node's —
+     pooling samples across nodes would let idle secondaries dilute a hot primary.
    - Applies the decision rules in `references/thresholds.md` to classify each cluster as
      **scale up**, **scale down**, **change disk/IOPS only**, or **no change**, with a
      confidence level based on how many days of data were available and how consistently the
