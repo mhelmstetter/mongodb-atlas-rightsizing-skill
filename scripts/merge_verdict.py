@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # rightsizing.py's reason text changes without updating this list to match).
 TRIGGER_KEYWORDS = {
     "cpu": "CPU p95",
-    "memory": "Free memory p95",
+    "memory": "Free memory p5",
     "cache_fill": "Cache fill ratio p95",
     "connections": "Connections p95",
     "iops": "IOPS p95",
@@ -234,7 +234,7 @@ def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path)
     lines = ["# Merged Rightsizing + DB Diagnostics Report", ""]
     lines.append(f"Project: `{rightsizing_report.get('groupId')}`  |  "
                  f"Lookback: {rightsizing_report.get('windowLabel', rightsizing_report.get('windowDays'))}  |  "
-                 f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z")
+                 f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
     lines.append("")
 
     results = rightsizing_report.get("results", [])
@@ -280,7 +280,7 @@ def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path)
                     prefix = "[DISAGREEMENT] " if "DISAGREEMENT" in note["note"] else "[AGREES] "
                     lines.append(f"{prefix}{note['note']}")
                     lines.append("")
-            elif r.get("verdict") == "scale_up":
+            elif r.get("verdict") in ("scale_up", "change_disk_or_iops"):
                 lines.append("*No db-internal signal corroborated or contradicted this verdict — "
                               "the Atlas-only reasoning above stands on its own.*")
                 lines.append("")

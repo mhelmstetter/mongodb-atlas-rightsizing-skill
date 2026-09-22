@@ -10,8 +10,8 @@ headroom than these defaults leave.
 | Signal | Threshold | Window |
 |---|---|---|
 | Normalized CPU (user+kernel) | p95 > 80% | sustained across ≥ 3 of the last 7 days |
-| Memory | free memory p95 < 10% of total, or rising eviction/cache-churn trend | last 7 days |
-| Disk IOPS | p95 > 90% of provisioned IOPS | sustained across ≥ 3 of the last 7 days |
+| Memory | free memory p5 < 10% of total (free/(free+used) per data point; low-is-bad, so the bottom tail) | last 7 days |
+| Disk IOPS | read+write p95 > 90% of provisioned IOPS (one shared budget) | sustained across ≥ 3 of the last 7 days |
 | Disk space used | p95 > 90% of capacity (NOT I/O saturation — see below) | sustained across ≥ 3 of the last 7 days |
 | Disk latency | read or write p95 > 15ms (heuristic, see below) | last 7 days |
 | Connections | p95 > 80% of tier's max connections | last 7 days |
@@ -127,9 +127,12 @@ already-scaled 0–100 values (e.g. a reading of `78.3` means 78.3%) — **do no
 ## Scale DOWN candidate (requires ALL of the following — this should be a conservative call)
 
 - Normalized CPU p95 < 20% for the entire window, not just average
-- Memory: free memory consistently > 40% of total
-- Disk IOPS and utilization both well under 50% of their ceilings
-- Connections well under the tier's limit
+- Memory: free memory p5 > 40% of total
+- Disk space used p95 < 50%, and read+write IOPS p95 < 50% of provisioned IOPS — if the cluster
+  config has no provisioned IOPS value, scale-down isn't recommended
+- Connections p95 < 30% of the tier's limit — if the tier isn't in `TIER_MAX_CONNECTIONS`,
+  scale-down isn't recommended
+- No gaps in the core metrics (every one ≥ 90% non-null data points)
 - At least 7 full days of data (30 preferred) with no gaps, and the window should be checked
   against the user for known low-traffic periods (don't recommend downsizing off of a holiday
   week's data)
@@ -161,7 +164,9 @@ from a response stop the script rather than dropping that metric.
 
 - **High**: ≥ 7 days of clean data and none of the Low conditions; for a scale-up, at least two
   signals fired (a single-signal scale-up is Medium).
-- **Medium**: 3–6 day window, or a single-signal scale-up.
+- **Medium**: 3–6 day window, a single-signal scale-up, or a check that couldn't run for lack of
+  a ceiling (no provisioned `diskIOPS` in the cluster config, or a tier missing from
+  `TIER_MAX_CONNECTIONS`) — listed under "Confidence notes".
 - **Low**: < 3 days of data, or gaps in the data — any core metric with less than 90% non-null
   data points (`MIN_COVERAGE`; node restarts, a pause, a cluster newer than the window) — or any
   threshold check with its value within 10% of the cutoff on either side (`NEAR_THRESHOLD_BAND`).

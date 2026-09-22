@@ -28,7 +28,6 @@ import argparse
 import json
 import os
 import re
-import statistics
 import sys
 import time
 from datetime import datetime, timezone
@@ -103,13 +102,10 @@ ROUTER_METRICS = [
 # insufficient_data — otherwise every check guarded on that metric silently doesn't run and the
 # result falls through to "no thresholds crossed".
 CORE_METRICS = [
-    "SYSTEM_NORMALIZED_CPU_USER",
-    "SYSTEM_NORMALIZED_CPU_KERNEL",
-    "SYSTEM_MEMORY_USED",
-    "SYSTEM_MEMORY_FREE",
+    "SYSTEM_NORMALIZED_CPU_TOTAL",   # derived: user + kernel per data point
+    "SYSTEM_MEMORY_FREE_PERCENT",    # derived: free / (free + used) per data point
     "CONNECTIONS",
-    "DISK_PARTITION_IOPS_READ",
-    "DISK_PARTITION_IOPS_WRITE",
+    "DISK_PARTITION_IOPS_TOTAL",     # derived: read + write per data point
     "DISK_PARTITION_SPACE_PERCENT_USED",
 ]
 
@@ -121,12 +117,10 @@ MIN_COVERAGE = 0.90
 # references/thresholds.md says that caps confidence at 'low'.
 NEAR_THRESHOLD_BAND = 0.10
 
-MAX_RETRIES = 6  # for 429 rate-limit responses in api_get()
+# Scale-up kinds that can be addressed by changing storage/IOPS without a compute tier change.
+DISK_ONLY_KINDS = {"iops", "disk_space", "disk_latency"}
 
-TIER_SPECS = {
-    "M10": (2, 2), "M20": (2, 4), "M30": (2, 8), "M40": (4, 16),
-    "M50": (8, 32), "M60": (16, 64), "M80": (32, 128),
-}
+MAX_RETRIES = 6  # for 429 rate-limit responses in api_get()
 
 # Max concurrent connections per tier, for the CONNECTIONS trigger below.
 # VERIFICATION STATUS: only M10 has been independently confirmed in this project, by reading
@@ -299,11 +293,27 @@ def _fetch_measurements(session, path, metric_names, period, granularity):
     return out
 
 
+def _combine(series_a, series_b, fn, label):
+    """Point-by-point combination of two series from the same response (same timestamps). A point
+    is None if either input is None."""
+    if len(series_a) != len(series_b):
+        sys.exit(f"Cannot combine {label}: series lengths differ ({len(series_a)} vs {len(series_b)}).")
+    return [None if a is None or b is None else fn(a, b) for a, b in zip(series_a, series_b)]
+
+
 def get_measurements(session, group_id, process_id, period, granularity):
     out = _fetch_measurements(
         session, f"/groups/{group_id}/processes/{process_id}/measurements",
         HOST_METRICS, period, granularity,
     )
+    # Derived series, computed per data point before any percentile is taken (a sum or ratio of
+    # percentiles isn't the percentile of the sum or ratio).
+    out["SYSTEM_NORMALIZED_CPU_TOTAL"] = _combine(
+        out["SYSTEM_NORMALIZED_CPU_USER"], out["SYSTEM_NORMALIZED_CPU_KERNEL"],
+        lambda u, k: u + k, "CPU user+kernel")
+    out["SYSTEM_MEMORY_FREE_PERCENT"] = _combine(
+        out["SYSTEM_MEMORY_FREE"], out["SYSTEM_MEMORY_USED"],
+        lambda f, u: 100 * f / (f + u), "memory free/(free+used)")
 
     # Disk metrics live under a per-partition sub-resource, not the process-level endpoint.
     disks = api_get(session, f"/groups/{group_id}/processes/{process_id}/disks")
@@ -313,6 +323,10 @@ def get_measurements(session, group_id, process_id, period, granularity):
             session, f"/groups/{group_id}/processes/{process_id}/disks/{name}/measurements",
             DISK_METRICS, period, granularity,
         )
+        # Provisioned IOPS is one budget shared by reads and writes.
+        disk_out["DISK_PARTITION_IOPS_TOTAL"] = _combine(
+            disk_out["DISK_PARTITION_IOPS_READ"], disk_out["DISK_PARTITION_IOPS_WRITE"],
+            lambda r, w: r + w, f"IOPS read+write on {name}")
         for k, v in disk_out.items():
             out.setdefault(k, []).extend(v)
 
@@ -337,6 +351,7 @@ def summarize(points):
     if not values:
         return None
     return {
+        "p5": round(pctl(values, 0.05), 2),
         "p50": round(pctl(values, 0.5), 2),
         "p95": round(pctl(values, 0.95), 2),
         "max": round(max(values), 2),
@@ -346,7 +361,8 @@ def summarize(points):
 
 
 def evaluate_cluster(cluster_cfg, process_metrics, window_days):
-    """Apply the threshold rules from references/thresholds.md. Returns (verdict, reasons, confidence).
+    """Apply the threshold rules from references/thresholds.md.
+    Returns (verdict, reasons, confidence, confidence_notes, summary).
 
     window_days is the lookback window expressed in days as a float (e.g. a 2-hour window is
     2/24 = 0.083) so the confidence-level thresholds below apply correctly to sub-day windows too.
@@ -381,39 +397,47 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         checks.append((label, observed, cutoff))
         return observed > cutoff if above else observed < cutoff
 
-    up_reasons = []
-    cpu = summary.get("SYSTEM_NORMALIZED_CPU_USER")
-    if exceeds("CPU p95", cpu["p95"], 80):
-        up_reasons.append(f"CPU p95 {cpu['p95']}% > 80% threshold")
+    # (kind, reason) — kind decides between scale_up and change_disk_or_iops below.
+    up = []
+    # Checks that couldn't run for lack of a ceiling to compare against. Surfaced, and they cap
+    # confidence at medium.
+    skipped = []
 
-    mem_free = summary.get("SYSTEM_MEMORY_FREE")
-    mem_used = summary.get("SYSTEM_MEMORY_USED")
-    total = mem_free["p50"] + mem_used["p50"]
-    if total > 0 and exceeds("Free memory p95 fraction", mem_free["p95"] / total, 0.10, above=False):
-        up_reasons.append("Free memory p95 < 10% of total")
+    cpu = summary["SYSTEM_NORMALIZED_CPU_TOTAL"]
+    if exceeds("CPU (user+kernel) p95", cpu["p95"], 80):
+        up.append(("cpu", f"CPU p95 {cpu['p95']}% (user+kernel) > 80% threshold"))
+
+    # Free memory is low-is-bad, so the tail that matters is the bottom one: p5, not p95.
+    mem_free_pct = summary["SYSTEM_MEMORY_FREE_PERCENT"]
+    if exceeds("Free memory p5", mem_free_pct["p5"], 10, above=False):
+        up.append(("memory", f"Free memory p5 {mem_free_pct['p5']}% < 10% of total"))
 
     # thresholds.md has documented this trigger since early in this script's history, but it was
     # never actually implemented — CONNECTIONS was pulled into the report table with no threshold
     # logic behind it. See TIER_MAX_CONNECTIONS for verification status of the per-tier ceilings.
-    conns = summary.get("CONNECTIONS")
-    max_conns = cluster_cfg.get("_max_connections")
-    if max_conns and exceeds("Connections p95", conns["p95"], 0.8 * max_conns):
-        up_reasons.append(
-            f"Connections p95 {conns['p95']} > 80% of tier's {max_conns} max connections"
-        )
+    conns = summary["CONNECTIONS"]
+    max_conns = cluster_cfg["_max_connections"]
+    if max_conns is None:
+        skipped.append("Connections check skipped: no max-connections value for this tier in "
+                       "TIER_MAX_CONNECTIONS (or shards have mixed tiers).")
+    elif exceeds("Connections p95", conns["p95"], 0.8 * max_conns):
+        up.append(("connections",
+                   f"Connections p95 {conns['p95']} > 80% of tier's {max_conns} max connections"))
 
-    for iops_name in ("DISK_PARTITION_IOPS_READ", "DISK_PARTITION_IOPS_WRITE"):
-        iops = summary.get(iops_name)
-        provisioned = cluster_cfg.get("_provisioned_iops")
-        if provisioned and exceeds(f"{iops_name} p95", iops["p95"], 0.9 * provisioned):
-            up_reasons.append(f"{iops_name} p95 {iops['p95']} > 90% of provisioned {provisioned}")
+    iops = summary["DISK_PARTITION_IOPS_TOTAL"]
+    provisioned = cluster_cfg["_provisioned_iops"]
+    if provisioned is None:
+        skipped.append("IOPS headroom check skipped: the cluster config has no single provisioned "
+                       "diskIOPS value to compare against.")
+    elif exceeds("IOPS (read+write) p95", iops["p95"], 0.9 * provisioned):
+        up.append(("iops", f"Disk IOPS p95 {iops['p95']} (read+write) > 90% of provisioned {provisioned}"))
 
     # NB: this is disk SPACE capacity used, not I/O busy-time/saturation — see DISK_METRICS
     # comment. Still a legitimate trigger (running out of disk space is a real problem), just
     # named for what it actually measures rather than implying an I/O-saturation signal.
-    space_used = summary.get("DISK_PARTITION_SPACE_PERCENT_USED")
+    space_used = summary["DISK_PARTITION_SPACE_PERCENT_USED"]
     if exceeds("Disk space used p95", space_used["p95"], 90):
-        up_reasons.append(f"Disk space used p95 {space_used['p95']}% > 90% of capacity")
+        up.append(("disk_space", f"Disk space used p95 {space_used['p95']}% > 90% of capacity"))
 
     # Real I/O-saturation signal: per-operation latency. Unlike IOPS, there's no Atlas-exposed
     # "provisioned throughput" ceiling to compare DISK_PARTITION_THROUGHPUT_READ/WRITE against, so
@@ -434,9 +458,8 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
             if iowait and iowait["p95"] > 5:
                 corroboration.append(f"CPU iowait p95 {iowait['p95']}%")
             note = f" ({', '.join(corroboration)} corroborate)" if corroboration else ""
-            up_reasons.append(
-                f"Disk {label} latency p95 {latency['p95']}ms > 15ms heuristic{note}"
-            )
+            up.append(("disk_latency",
+                       f"Disk {label} latency p95 {latency['p95']}ms > 15ms heuristic{note}"))
 
     # TICKETS_AVAILABLE_READS/WRITE are pulled for context (below) but are NOT a trigger. On
     # MongoDB 7.0+, WiredTiger's execution control dynamically resizes the concurrency ticket
@@ -457,10 +480,9 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
                 f", OP_EXECUTION_TIME_{label.upper()}S p95 {exec_time['p95']}ms corroborates latency impact"
                 if exec_time and exec_time["p95"] > 0 else ""
             )
-            up_reasons.append(
-                f"{label.capitalize()} concurrency queue p95 {q['p95']} > 0 — operations are "
-                f"actually waiting for a WiredTiger ticket, not just a low available count{corroboration}"
-            )
+            up.append(("queue",
+                       f"{label.capitalize()} concurrency queue p95 {q['p95']} > 0 — operations are "
+                       f"actually waiting for a WiredTiger ticket, not just a low available count{corroboration}"))
 
     # Not in the original skill's thresholds.md — added as a heuristic (see references/thresholds.md
     # "WiredTiger cache pressure" section). Page faults/sec is cheap on Atlas's SSD-backed storage, so
@@ -473,10 +495,9 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
             f", CACHE_BYTES_READ_INTO p95 {cache_read['p95']} B/s corroborates cache misses"
             if cache_read and cache_read["p95"] > 0 else ""
         )
-        up_reasons.append(
-            f"Page faults p95 {page_faults['p95']}/sec > 1.0/sec heuristic — WiredTiger cache may be "
-            f"undersized for the working set{corroboration}"
-        )
+        up.append(("page_faults",
+                   f"Page faults p95 {page_faults['p95']}/sec > 1.0/sec heuristic — WiredTiger cache may be "
+                   f"undersized for the working set{corroboration}"))
 
     # WiredTiger eviction thresholds (see references/thresholds.md "WiredTiger eviction thresholds").
     # eviction_target/eviction_dirty_target (80%/5%) are the point where WT's *background* eviction
@@ -487,25 +508,29 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     # escalates to the fully pressured state.
     cache_fill = summary.get("CACHE_FILL_RATIO")
     if cache_fill and exceeds("Cache fill ratio p95", cache_fill["p95"], 80):
-        up_reasons.append(
-            f"Cache fill ratio p95 {cache_fill['p95']}% > 80% (eviction_target) — "
-            f"background eviction likely running continuously"
-        )
+        up.append(("cache_fill",
+                   f"Cache fill ratio p95 {cache_fill['p95']}% > 80% (eviction_target) — "
+                   f"background eviction likely running continuously"))
 
     dirty_fill = summary.get("DIRTY_FILL_RATIO")
     if dirty_fill and exceeds("Dirty fill ratio p95", dirty_fill["p95"], 5):
-        up_reasons.append(
-            f"Dirty fill ratio p95 {dirty_fill['p95']}% > 5% (eviction_dirty_target) — "
-            f"dirty-page eviction likely running continuously"
-        )
+        up.append(("dirty_fill",
+                   f"Dirty fill ratio p95 {dirty_fill['p95']}% > 5% (eviction_dirty_target) — "
+                   f"dirty-page eviction likely running continuously"))
 
     latency_r = summary.get("DISK_PARTITION_LATENCY_READ")
     latency_w = summary.get("DISK_PARTITION_LATENCY_WRITE")
 
+    # Gaps are computed before the scale-down decision: thresholds.md requires a gap-free window
+    # for a scale-down, not just a lower confidence on one.
+    low_coverage = {m: summary[m]["coverage"] for m in CORE_METRICS if summary[m]["coverage"] < MIN_COVERAGE}
+
     down_ok = (
         cpu["p95"] < 20
-        and mem_free["p50"] / total > 0.40
+        and mem_free_pct["p5"] > 40
         and space_used["p95"] < 50
+        and provisioned is not None and iops["p95"] < 0.5 * provisioned
+        and max_conns is not None and conns["p95"] < 0.3 * max_conns
         and (not page_faults or page_faults["p95"] < 0.5)
         and (not cache_fill or cache_fill["p95"] < 50)
         and (not dirty_fill or dirty_fill["p95"] < 2)
@@ -513,26 +538,31 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         and (not queue_w or queue_w["max"] == 0)
         and (not latency_r or latency_r["p95"] < 5)
         and (not latency_w or latency_w["p95"] < 5)
-        and (not max_conns or conns["p95"] < 0.3 * max_conns)
+        and not low_coverage
         and window_days >= 7
     )
 
-    if up_reasons:
+    up_reasons = [reason for _, reason in up]
+    if up and all(kind in DISK_ONLY_KINDS for kind, _ in up):
+        # thresholds.md: a disk bottleneck doesn't always need a compute tier change — more IOPS
+        # or storage alone may resolve it.
+        verdict = "change_disk_or_iops"
+        reasons = up_reasons
+    elif up:
         verdict = "scale_up"
         reasons = up_reasons
     elif down_ok:
         verdict = "scale_down_candidate"
-        reasons = ["CPU, memory, and disk all comfortably under scale-down thresholds"]
+        reasons = ["CPU, memory, disk, IOPS, and connections all comfortably under scale-down thresholds"]
     else:
         verdict = "no_change"
         reasons = ["No thresholds crossed; metrics are in the comfortable mid-range"]
 
     # Confidence rules from references/thresholds.md. Low: < 3 days, gaps in the data, or any
-    # metric near a threshold boundary. High: >= 7 days of clean data and either no scale-up or a
-    # multi-signal one. Explanations go in confidence_notes, not reasons — merge_verdict.py matches
-    # on reason text to tell which triggers fired.
-    confidence_notes = []
-    low_coverage = {m: summary[m]["coverage"] for m in CORE_METRICS if summary[m]["coverage"] < MIN_COVERAGE}
+    # metric near a threshold boundary. Medium at most if a check was skipped. High: >= 7 days of
+    # clean data and either no scale-up or a multi-signal one. Explanations go in confidence_notes,
+    # not reasons — merge_verdict.py matches on reason text to tell which triggers fired.
+    confidence_notes = list(skipped)
     if low_coverage:
         confidence_notes.append(
             "Gaps in the data (non-null share of data points below "
@@ -549,7 +579,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
 
     if window_days < 3 or low_coverage or near:
         confidence = "low"
-    elif window_days >= 7 and (not up_reasons or len(up_reasons) >= 2):
+    elif window_days >= 7 and not skipped and (not up or len(up) >= 2):
         confidence = "high"
     else:
         confidence = "medium"
@@ -560,6 +590,16 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
 CONFIDENCE_ORDER = ["low", "medium", "high"]
 
 
+def _by_node(per_node, all_nodes):
+    """[(node, text), ...] -> one line per distinct text, prefixed with the nodes it applies to
+    ("all nodes" when every node has it)."""
+    nodes_for = {}
+    for node, text in per_node:
+        nodes_for.setdefault(text, []).append(node)
+    return [f"{'all nodes' if len(nodes) == len(all_nodes) else ', '.join(nodes)}: {text}"
+            for text, nodes in nodes_for.items()]
+
+
 def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
     """Evaluate one group of processes (a shard, a config-server RS, or a whole non-sharded
     cluster). Each node is evaluated on its own and the results combined: pooling samples across
@@ -567,9 +607,9 @@ def evaluate_process_group(session, group_id, procs, cfg, period, granularity, w
     the primary is only a third of the samples). Connection limits and provisioned IOPS are
     per-node ceilings too.
 
-    Group verdict: insufficient_data if any node has it, scale_up if any node needs it,
-    scale_down_candidate only if every node qualifies, otherwise no_change. Confidence is the
-    lowest across nodes."""
+    Group verdict: insufficient_data if any node has it, then scale_up, then change_disk_or_iops if
+    any node needs it; scale_down_candidate only if every node qualifies, otherwise no_change.
+    Confidence is the lowest across nodes."""
     nodes = {}
     for p in procs:
         metrics = get_measurements(session, group_id, p["id"], period, granularity)
@@ -580,21 +620,28 @@ def evaluate_process_group(session, group_id, procs, cfg, period, granularity, w
         verdict = "insufficient_data"
     elif "scale_up" in verdicts:
         verdict = "scale_up"
+    elif "change_disk_or_iops" in verdicts:
+        verdict = "change_disk_or_iops"
     elif verdicts == {"scale_down_candidate"}:
         verdict = "scale_down_candidate"
     else:
         verdict = "no_change"
 
-    if verdict in ("insufficient_data", "scale_up"):
-        reasons = [f"{node}: {reason}" for node, (v, node_reasons, _, _, _) in nodes.items()
-                   if v == verdict for reason in node_reasons]
+    if verdict == "insufficient_data":
+        reasons = _by_node([(node, reason) for node, (v, node_reasons, _, _, _) in nodes.items()
+                            if v == verdict for reason in node_reasons], nodes)
+    elif verdict in ("scale_up", "change_disk_or_iops"):
+        reasons = _by_node([(node, reason) for node, (v, node_reasons, _, _, _) in nodes.items()
+                            if v in ("scale_up", "change_disk_or_iops") for reason in node_reasons], nodes)
     elif verdict == "scale_down_candidate":
-        reasons = ["CPU, memory, and disk all comfortably under scale-down thresholds on every node"]
+        reasons = ["CPU, memory, disk, IOPS, and connections all comfortably under scale-down "
+                   "thresholds on every node"]
     else:
         reasons = ["No thresholds crossed on any node; metrics are in the comfortable mid-range"]
 
     confidence = min((c for _, _, c, _, _ in nodes.values()), key=CONFIDENCE_ORDER.index)
-    confidence_notes = [f"{node}: {note}" for node, (_, _, _, notes, _) in nodes.items() for note in notes]
+    confidence_notes = _by_node([(node, note) for node, (_, _, _, notes, _) in nodes.items()
+                                 for note in notes], nodes)
     summary = {node: node_summary for node, (_, _, _, _, node_summary) in nodes.items()}
     return verdict, reasons, confidence, confidence_notes, summary
 
@@ -620,7 +667,7 @@ def evaluate_router_group(session, group_id, procs, period, granularity):
 def build_report(group_id, results, window_label):
     lines = [f"# Atlas Rightsizing Report", "",
              f"Project: `{group_id}`  |  Lookback: {window_label}  |  "
-             f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z", ""]
+             f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}", ""]
     for r in results:
         lines.append(f"## {r['cluster']}  —  {r['current_tier']}")
         lines.append(f"**Verdict: {r['verdict'].replace('_', ' ').upper()}**  (confidence: {r['confidence']})")
@@ -659,9 +706,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--group-id", required=True, help="Atlas project (group) ID")
     ap.add_argument("--cluster", help="Cluster name; omit to audit every cluster in the project")
-    ap.add_argument("--days", type=float, default=7,
+    ap.add_argument("--days", type=int, default=7,
                      help="Lookback window in days (default 7). Ignored if --hours is given.")
-    ap.add_argument("--hours", type=float, default=None,
+    ap.add_argument("--hours", type=int, default=None,
                      help="Lookback window in hours, for quick/ad-hoc checks (e.g. --hours 2). "
                           "Overrides --days. Windows under 3 days always report 'low' confidence "
                           "(see references/thresholds.md) — this is for spot-checking a live "
@@ -670,10 +717,12 @@ def main():
     ap.add_argument("--client-id"); ap.add_argument("--client-secret")
     ap.add_argument("--public-key"); ap.add_argument("--private-key")
     args = ap.parse_args()
+    if args.days < 1 or (args.hours is not None and args.hours < 1):
+        ap.error("--days and --hours must be positive whole numbers")
 
     if args.hours is not None:
         window_days = args.hours / 24
-        period = f"PT{args.hours:g}H"
+        period = f"PT{args.hours}H"
         # Atlas only retains PT1M (1-minute) resolution for ~38-48h back — beyond that it's
         # already rolled up, so requesting PT1M for a longer window would silently return nulls
         # for the older portion. Use the finest resolution Atlas actually has for the window:
@@ -681,16 +730,15 @@ def main():
         # bucket and can hide brief spikes — e.g. a queue depth that briefly hit 6 read back as
         # max 2.4 at PT5M and max 1 at PT1H over the same window). Stay a margin under the
         # observed ~38h cutoff to be safe.
-        # (Only PT1M's retention window was actually verified against the live API — see the
-        # check above. Not asserting a specific retention cutoff for PT5M, so anything beyond the
-        # verified PT1M window falls back to PT1H rather than guessing at an untested boundary.)
+        # Only PT1M's retention window was verified against the live API; no PT5M retention cutoff
+        # is assumed, so windows beyond it use PT1H.
         granularity = "PT1M" if args.hours <= 36 else "PT1H"
-        window_label = f"{args.hours:g} hours"
+        window_label = f"{args.hours} hours"
     else:
         window_days = args.days
-        period = f"P{args.days:g}D"
+        period = f"P{args.days}D"
         granularity = "PT1H"
-        window_label = f"{args.days:g} days"
+        window_label = f"{args.days} days"
 
     session = get_session(args)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -707,11 +755,8 @@ def main():
         # REPLICASET — so this works unmodified for either topology. Atlas supports per-shard
         # ("asymmetric") tiers, so don't assume a single tier: report the full set, and flag it
         # explicitly if shards are mixed.
-        specs = cfg.get("replicationSpecs", [])
-        tiers = sorted({
-            spec.get("regionConfigs", [{}])[0].get("electableSpecs", {}).get("instanceSize", "UNKNOWN")
-            for spec in specs
-        }) or ["UNKNOWN"]
+        region_configs = [rc for spec in cfg["replicationSpecs"] for rc in spec["regionConfigs"]]
+        tiers = sorted({rc["electableSpecs"]["instanceSize"] for rc in region_configs})
         tier_display = tiers[0] if len(tiers) == 1 else "mixed: " + ", ".join(tiers)
         # Same "single value or skip" logic as provisioned IOPS below — a mixed-tier sharded
         # cluster has no single ceiling to compare a pooled CONNECTIONS reading against.
@@ -725,10 +770,9 @@ def main():
             })
             continue
 
-        iops_values = sorted({
-            spec.get("regionConfigs", [{}])[0].get("electableSpecs", {}).get("diskIOPS")
-            for spec in specs
-        } - {None})
+        # diskIOPS is absent for storage without separately provisioned IOPS; that case is
+        # surfaced as a skipped check in evaluate_cluster().
+        iops_values = sorted({rc["electableSpecs"].get("diskIOPS") for rc in region_configs} - {None})
         # Can't reliably join a specific shard's replicaSetName back to its specific
         # replicationSpecs entry (see group_processes_by_replica_set docstring), so if shards
         # have DIFFERENT provisioned IOPS, don't guess — skip that one threshold check for every
@@ -754,6 +798,19 @@ def main():
             })
             continue
 
+        # With autoscaling on, Atlas already moves the tier (or disk size) within the configured
+        # bounds, so a scale verdict is about those bounds rather than the current tier.
+        autoscaling_notes = []
+        compute_as = [rc["autoScaling"]["compute"] for rc in region_configs if rc["autoScaling"]["compute"]["enabled"]]
+        if compute_as:
+            bounds = sorted({f"{a['minInstanceSize']}–{a['maxInstanceSize']}" for a in compute_as})
+            autoscaling_notes.append(
+                f"Compute autoscaling is enabled ({', '.join(bounds)}): Atlas already scales the tier "
+                f"within these bounds, so a scale verdict means reviewing the bounds, not the tier.")
+        if any(rc["autoScaling"]["diskGB"]["enabled"] for rc in region_configs):
+            autoscaling_notes.append("Storage autoscaling is enabled: Atlas grows disk automatically, "
+                                     "so a disk-space trigger is less urgent.")
+
         procs = list_processes_for_cluster(session, args.group_id, cfg)
         shard_groups, routers = group_processes_by_replica_set(procs)
 
@@ -765,8 +822,7 @@ def main():
             verdict, reasons, confidence, confidence_notes, summary = evaluate_process_group(
                 session, args.group_id, group_procs, cfg, period, granularity, window_days
             )
-            if iops_note:
-                reasons = reasons + [iops_note]
+            reasons = reasons + ([iops_note] if iops_note else []) + autoscaling_notes
             results.append({
                 "cluster": name, "current_tier": tier_display, "verdict": verdict,
                 "reasons": reasons, "confidence": confidence,
@@ -783,8 +839,7 @@ def main():
                 verdict, reasons, confidence, confidence_notes, summary = evaluate_process_group(
                     session, args.group_id, shard_groups[rs_name], shard_cfg, period, granularity, window_days
                 )
-                if iops_note:
-                    reasons = reasons + [iops_note]
+                reasons = reasons + ([iops_note] if iops_note else []) + autoscaling_notes
                 results.append({
                     "cluster": f"{name} — shard {rs_name}", "current_tier": tier_display,
                     "verdict": verdict, "reasons": reasons, "confidence": confidence,

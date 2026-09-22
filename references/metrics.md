@@ -35,6 +35,10 @@ window) instead — see `rightsizing.py`'s `main()`.
 | `CACHE_FILL_RATIO` / `DIRTY_FILL_RATIO` | WT eviction pressure, already scaled 0–100 (`units: PERCENT` — do not multiply by 100). See "WiredTiger eviction thresholds" in `references/thresholds.md` for the `eviction_target`/`eviction_dirty_target` triggers these compare against. |
 | `SYSTEM_NORMALIZED_CPU_IOWAIT` | Context only — corroborates disk-latency findings with actual CPU stall time. |
 
+Derived per data point (before percentiles, since a sum of percentiles isn't the percentile of
+the sum): `SYSTEM_NORMALIZED_CPU_TOTAL` (user + kernel) and `SYSTEM_MEMORY_FREE_PERCENT`
+(free / (free + used)).
+
 ## Disk-level metrics (`DISK_METRICS` in `rightsizing.py`)
 
 | Metric | Why it matters for rightsizing |
@@ -44,6 +48,9 @@ window) instead — see `rightsizing.py`'s `main()`.
 | `DISK_PARTITION_SPACE_USED` / `DISK_PARTITION_SPACE_FREE` | Raw values backing the percentage above — used to sanity-check it and for absolute-size context in the report. |
 | `DISK_PARTITION_LATENCY_READ` / `WRITE` | The real "is the disk keeping up" signal (ms per op) — see `references/thresholds.md` "Disk latency / throughput / iowait." No ceiling needed to be meaningful, unlike IOPS. |
 | `DISK_PARTITION_THROUGHPUT_READ` / `WRITE` | Context only — Atlas exposes no "provisioned throughput" ceiling to compare against, unlike `diskIOPS`. |
+
+Derived per data point, per partition: `DISK_PARTITION_IOPS_TOTAL` (read + write), compared
+against provisioned IOPS since reads and writes share that budget.
 
 For sharded clusters, pull the same metrics per shard's processes and evaluate each shard
 independently — one hot shard shouldn't get masked by averaging across a well-balanced cluster.

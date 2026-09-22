@@ -155,7 +155,7 @@ def main():
     elapsed = time.time() - t0
 
     diagnostics = {
-        "sampled_at": datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z",
+        "sampled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sample_interval_s": round(elapsed, 1),
         "server_status_summary": summarize_server_status(before, after, elapsed),
         "working_set": get_working_set(client, databases),

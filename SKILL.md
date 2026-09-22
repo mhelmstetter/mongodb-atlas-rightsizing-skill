@@ -30,7 +30,7 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
    - Lookback window (default: 7 days — long enough to smooth daily cycles, short enough to stay
      current). Offer 30 days if the user cares about monthly peaks (e.g. batch jobs, reporting).
      For spot-checking a live/in-progress situation, `--hours` (e.g. `--hours 2`) runs the same
-     evaluation over a sub-day window at 5-minute granularity — always reports "low" confidence
+     evaluation over a sub-day window at 1-minute granularity (1-hour beyond 36 hours) — always reports "low" confidence
      (see references/thresholds.md) and should not replace the default 7-day audit for an actual
      sizing decision.
 
@@ -46,8 +46,9 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
    See `scripts/rightsizing.py --help` for auth flag details.
 
 3. **What the script does** (for each target cluster):
-   - Fetches cluster config: `GET /groups/{groupId}/clusters/{clusterName}` — current tier,
-     disk size, provisioned IOPS, whether autoscaling is on.
+   - Fetches cluster config: `GET /groups/{groupId}/clusters/{clusterName}` — current tier and
+     provisioned IOPS across every region config, and whether compute/storage autoscaling is on
+     (noted in the verdict: with autoscaling on, a scale verdict is about the autoscaling bounds).
    - Fetches the process list for the cluster: `GET /groups/{groupId}/processes` (all pages),
      keeping only processes whose host matches the host prefix and domain in the cluster's own
      `connectionStrings.standard` (`<prefix>-shard-NN-NN` / `<prefix>-config-NN-NN`), so clusters
@@ -60,7 +61,8 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
      evaluates each node on its own. A replica set's (or shard's) verdict is the worst node's —
      pooling samples across nodes would let idle secondaries dilute a hot primary.
    - Applies the decision rules in `references/thresholds.md` to classify each cluster as
-     **scale up**, **scale down**, **change disk/IOPS only**, or **no change**, with a
+     **scale up**, **scale down**, **change disk/IOPS only** (every trigger that fired is a
+     disk IOPS, latency, or space trigger), or **no change**, with a
      confidence level based on how many days of data were available and how consistently the
      signal held.
 
