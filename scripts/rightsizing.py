@@ -85,6 +85,19 @@ DISK_METRICS = [
 
 METRICS = HOST_METRICS + DISK_METRICS
 
+# The HOST_METRICS a mongos exposes (verified against a live mongos's measurement list): it has no
+# storage engine, so no WiredTiger cache/ticket/lock-queue/op-execution series — requesting those
+# 404s with INVALID_METRIC_NAME.
+ROUTER_METRICS = [
+    "SYSTEM_NORMALIZED_CPU_USER",
+    "SYSTEM_NORMALIZED_CPU_KERNEL",
+    "SYSTEM_MEMORY_USED",
+    "SYSTEM_MEMORY_FREE",
+    "CONNECTIONS",
+    "EXTRA_INFO_PAGE_FAULTS",
+    "SYSTEM_NORMALIZED_CPU_IOWAIT",
+]
+
 # A verdict needs these to have at least one data point. If any is empty, the cluster/shard gets
 # insufficient_data — otherwise every check guarded on that metric silently doesn't run and the
 # result falls through to "no thresholds crossed".
@@ -524,7 +537,7 @@ def evaluate_router_group(session, group_id, procs, period, granularity):
             continue
         m = _fetch_measurements(
             session, f"/groups/{group_id}/processes/{pid}/measurements",
-            HOST_METRICS, period, granularity,
+            ROUTER_METRICS, period, granularity,
         )
         for name, values in m.items():
             agg.setdefault(name, []).extend(values)
