@@ -29,6 +29,7 @@ import json
 import os
 import statistics
 import sys
+import time
 from datetime import datetime, timezone
 
 try:
@@ -83,6 +84,30 @@ DISK_METRICS = [
 ]
 
 METRICS = HOST_METRICS + DISK_METRICS
+
+# A verdict needs these to have at least one data point. If any is empty, the cluster/shard gets
+# insufficient_data — otherwise every check guarded on that metric silently doesn't run and the
+# result falls through to "no thresholds crossed".
+CORE_METRICS = [
+    "SYSTEM_NORMALIZED_CPU_USER",
+    "SYSTEM_NORMALIZED_CPU_KERNEL",
+    "SYSTEM_MEMORY_USED",
+    "SYSTEM_MEMORY_FREE",
+    "CONNECTIONS",
+    "DISK_PARTITION_IOPS_READ",
+    "DISK_PARTITION_IOPS_WRITE",
+    "DISK_PARTITION_SPACE_PERCENT_USED",
+]
+
+# Fraction of returned data points that must be non-null for every core metric; below this the
+# window has gaps (restarts, pauses, cluster newer than the window) and confidence is 'low'.
+MIN_COVERAGE = 0.90
+
+# An observed value within this fraction of a threshold (either side) is "near the boundary" —
+# references/thresholds.md says that caps confidence at 'low'.
+NEAR_THRESHOLD_BAND = 0.10
+
+MAX_RETRIES = 5  # for 429 rate-limit responses in api_get()
 
 TIER_SPECS = {
     "M10": (2, 2), "M20": (2, 4), "M30": (2, 8), "M40": (4, 16),
@@ -139,10 +164,18 @@ def _get_oauth_token(client_id, client_secret):
 
 
 def api_get(session, path, params=None):
-    resp = session.get(f"{ATLAS_BASE}{path}", params=params, timeout=30)
-    if not resp.ok:
-        sys.exit(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
-    return resp.json()
+    """GET an Atlas Admin API path (relative to ATLAS_BASE). Retries 429 rate-limit responses
+    (auditing many processes/partitions can hit Atlas's per-project limit); any other error, or a
+    429 that persists past MAX_RETRIES, exits — a partial metric set must never be evaluated as if
+    it were complete."""
+    for attempt in range(MAX_RETRIES + 1):
+        resp = session.get(f"{ATLAS_BASE}{path}", params=params, timeout=30)
+        if resp.status_code == 429 and attempt < MAX_RETRIES:
+            time.sleep(int(resp.headers.get("Retry-After", 2 ** attempt)))
+            continue
+        if not resp.ok:
+            sys.exit(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
+        return resp.json()
 
 
 def list_clusters(session, group_id):
@@ -192,39 +225,36 @@ def group_processes_by_replica_set(procs):
     return shard_groups, routers
 
 
-def _fetch_measurements(session, url, metric_names, period, granularity):
+def _fetch_measurements(session, path, metric_names, period, granularity):
+    """Returns {metric_name: [value or None, ...]} — one entry per data point Atlas returned,
+    INCLUDING null values. Nulls mark gaps (restarts, pauses, or time before the cluster existed)
+    and are kept so evaluate_cluster() can measure data coverage, not just the non-null samples."""
     query = [("granularity", granularity), ("period", period)] + [("m", m) for m in metric_names]
-    resp = session.get(url, params=query, timeout=30)
-    if not resp.ok:
-        return {}
-    data = resp.json()
-    out = {}
-    for m in data.get("measurements", []):
-        values = [dp["value"] for dp in m.get("dataPoints", []) if dp.get("value") is not None]
-        out[m["name"]] = values
+    data = api_get(session, path, params=query)
+    out = {m["name"]: [dp["value"] for dp in m["dataPoints"]] for m in data["measurements"]}
+    missing = [m for m in metric_names if m not in out]
+    if missing:
+        sys.exit(f"Atlas returned no series for {missing} on {path} — the measurement names may "
+                 f"have changed; check the current MeasurementView enum.")
     return out
 
 
 def get_measurements(session, group_id, process_id, period, granularity):
     out = _fetch_measurements(
-        session, f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/measurements",
+        session, f"/groups/{group_id}/processes/{process_id}/measurements",
         HOST_METRICS, period, granularity,
     )
 
     # Disk metrics live under a per-partition sub-resource, not the process-level endpoint.
-    disks_resp = session.get(f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/disks", timeout=30)
-    if disks_resp.ok:
-        for partition in disks_resp.json().get("results", []):
-            name = partition.get("partitionName")
-            if not name:
-                continue
-            disk_out = _fetch_measurements(
-                session,
-                f"{ATLAS_BASE}/groups/{group_id}/processes/{process_id}/disks/{name}/measurements",
-                DISK_METRICS, period, granularity,
-            )
-            for k, v in disk_out.items():
-                out.setdefault(k, []).extend(v)
+    disks = api_get(session, f"/groups/{group_id}/processes/{process_id}/disks")
+    for partition in disks["results"]:
+        name = partition["partitionName"]
+        disk_out = _fetch_measurements(
+            session, f"/groups/{group_id}/processes/{process_id}/disks/{name}/measurements",
+            DISK_METRICS, period, granularity,
+        )
+        for k, v in disk_out.items():
+            out.setdefault(k, []).extend(v)
 
     return out
 
@@ -240,7 +270,10 @@ def pctl(values, p):
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-def summarize(values):
+def summarize(points):
+    """points is every data point Atlas returned, including nulls (gaps). Percentiles are over the
+    non-null values; coverage is the non-null fraction."""
+    values = [v for v in points if v is not None]
     if not values:
         return None
     return {
@@ -248,6 +281,7 @@ def summarize(values):
         "p95": round(pctl(values, 0.95), 2),
         "max": round(max(values), 2),
         "n": len(values),
+        "coverage": round(len(values) / len(points), 3),
     }
 
 
@@ -264,41 +298,46 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
 
     summary = {name: summarize(vals) for name, vals in agg.items()}
 
-    # If NOTHING came back — no processes matched, every measurements call returned empty, or the
-    # cluster/shard is simply too new to have any data in the requested window — don't let the
-    # threshold logic below run on an empty summary and fall through to "no thresholds crossed"
-    # with high confidence. That's backwards: no data means no basis for ANY verdict, let alone a
-    # confident one. Confirmed as a real failure mode, not just theoretical: pointing this script
-    # at a cluster created ~30 minutes earlier returned a completely empty metric table but still
-    # reported "confidence: high" before this check was added.
-    if not any(summary.values()):
+    # Every threshold check below is guarded on its metric being present, so a missing core metric
+    # would silently skip its checks and fall through to "no thresholds crossed". No data for a
+    # core metric means no basis for a verdict (e.g. a cluster created minutes before the run).
+    missing_core = [m for m in CORE_METRICS if not summary.get(m)]
+    if missing_core:
         return (
             "insufficient_data",
-            ["No metrics data available for the requested window — the cluster/shard may be too "
-             "new (check its creation time), paused, or unreachable. Not a basis for any "
-             "scale-up/down/no-change verdict; re-run once it has some operating history."],
+            [f"No data in the requested window for: {', '.join(missing_core)}. The cluster/shard "
+             f"may be too new (check its creation time), paused, or unreachable. Not a basis for "
+             f"any scale-up/down/no-change verdict; re-run once it has some operating history."],
             "low",
+            [],
             summary,
         )
 
+    # Every threshold comparison is recorded so confidence can account for values sitting near a
+    # boundary, whether or not the check fired.
+    checks = []
+
+    def exceeds(label, observed, cutoff, above=True):
+        checks.append((label, observed, cutoff))
+        return observed > cutoff if above else observed < cutoff
+
     up_reasons = []
     cpu = summary.get("SYSTEM_NORMALIZED_CPU_USER")
-    if cpu and cpu["p95"] > 80:
+    if exceeds("CPU p95", cpu["p95"], 80):
         up_reasons.append(f"CPU p95 {cpu['p95']}% > 80% threshold")
 
     mem_free = summary.get("SYSTEM_MEMORY_FREE")
     mem_used = summary.get("SYSTEM_MEMORY_USED")
-    if mem_free and mem_used:
-        total = mem_free["p50"] + mem_used["p50"]
-        if total > 0 and (mem_free["p95"] / total) < 0.10:
-            up_reasons.append("Free memory p95 < 10% of total")
+    total = mem_free["p50"] + mem_used["p50"]
+    if total > 0 and exceeds("Free memory p95 fraction", mem_free["p95"] / total, 0.10, above=False):
+        up_reasons.append("Free memory p95 < 10% of total")
 
     # thresholds.md has documented this trigger since early in this script's history, but it was
     # never actually implemented — CONNECTIONS was pulled into the report table with no threshold
     # logic behind it. See TIER_MAX_CONNECTIONS for verification status of the per-tier ceilings.
     conns = summary.get("CONNECTIONS")
     max_conns = cluster_cfg.get("_max_connections")
-    if conns and max_conns and conns["p95"] > 0.8 * max_conns:
+    if max_conns and exceeds("Connections p95", conns["p95"], 0.8 * max_conns):
         up_reasons.append(
             f"Connections p95 {conns['p95']} > 80% of tier's {max_conns} max connections"
         )
@@ -306,14 +345,14 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     for iops_name in ("DISK_PARTITION_IOPS_READ", "DISK_PARTITION_IOPS_WRITE"):
         iops = summary.get(iops_name)
         provisioned = cluster_cfg.get("_provisioned_iops")
-        if iops and provisioned and iops["p95"] > 0.9 * provisioned:
+        if provisioned and exceeds(f"{iops_name} p95", iops["p95"], 0.9 * provisioned):
             up_reasons.append(f"{iops_name} p95 {iops['p95']} > 90% of provisioned {provisioned}")
 
     # NB: this is disk SPACE capacity used, not I/O busy-time/saturation — see DISK_METRICS
     # comment. Still a legitimate trigger (running out of disk space is a real problem), just
     # named for what it actually measures rather than implying an I/O-saturation signal.
     space_used = summary.get("DISK_PARTITION_SPACE_PERCENT_USED")
-    if space_used and space_used["p95"] > 90:
+    if exceeds("Disk space used p95", space_used["p95"], 90):
         up_reasons.append(f"Disk space used p95 {space_used['p95']}% > 90% of capacity")
 
     # Real I/O-saturation signal: per-operation latency. Unlike IOPS, there's no Atlas-exposed
@@ -326,7 +365,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         ("write", "DISK_PARTITION_LATENCY_WRITE", "DISK_PARTITION_THROUGHPUT_WRITE"),
     ):
         latency = summary.get(latency_name)
-        if latency and latency["p95"] > 15:
+        if latency and exceeds(f"Disk {label} latency p95", latency["p95"], 15):
             throughput = summary.get(throughput_name)
             iowait = summary.get("SYSTEM_NORMALIZED_CPU_IOWAIT")
             corroboration = []
@@ -368,7 +407,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     # this is intentionally sensitive; treat a lone trigger here as weaker evidence than CPU/IOPS/disk,
     # and note whether CACHE_BYTES_READ_INTO also elevated (context, not itself a trigger).
     page_faults = summary.get("EXTRA_INFO_PAGE_FAULTS")
-    if page_faults and page_faults["p95"] > 1.0:
+    if page_faults and exceeds("Page faults p95", page_faults["p95"], 1.0):
         cache_read = summary.get("CACHE_BYTES_READ_INTO")
         corroboration = (
             f", CACHE_BYTES_READ_INTO p95 {cache_read['p95']} B/s corroborates cache misses"
@@ -387,14 +426,14 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     # assumption that sustained background-eviction pressure is itself worth flagging before it
     # escalates to the fully pressured state.
     cache_fill = summary.get("CACHE_FILL_RATIO")
-    if cache_fill and cache_fill["p95"] > 80:
+    if cache_fill and exceeds("Cache fill ratio p95", cache_fill["p95"], 80):
         up_reasons.append(
             f"Cache fill ratio p95 {cache_fill['p95']}% > 80% (eviction_target) — "
             f"background eviction likely running continuously"
         )
 
     dirty_fill = summary.get("DIRTY_FILL_RATIO")
-    if dirty_fill and dirty_fill["p95"] > 5:
+    if dirty_fill and exceeds("Dirty fill ratio p95", dirty_fill["p95"], 5):
         up_reasons.append(
             f"Dirty fill ratio p95 {dirty_fill['p95']}% > 5% (eviction_dirty_target) — "
             f"dirty-page eviction likely running continuously"
@@ -404,9 +443,9 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
     latency_w = summary.get("DISK_PARTITION_LATENCY_WRITE")
 
     down_ok = (
-        cpu and cpu["p95"] < 20
-        and mem_free and mem_used and (mem_free["p50"] / max(mem_free["p50"] + mem_used["p50"], 1)) > 0.40
-        and (not space_used or space_used["p95"] < 50)
+        cpu["p95"] < 20
+        and mem_free["p50"] / total > 0.40
+        and space_used["p95"] < 50
         and (not page_faults or page_faults["p95"] < 0.5)
         and (not cache_fill or cache_fill["p95"] < 50)
         and (not dirty_fill or dirty_fill["p95"] < 2)
@@ -414,7 +453,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         and (not queue_w or queue_w["max"] == 0)
         and (not latency_r or latency_r["p95"] < 5)
         and (not latency_w or latency_w["p95"] < 5)
-        and (not conns or not max_conns or conns["p95"] < 0.3 * max_conns)
+        and (not max_conns or conns["p95"] < 0.3 * max_conns)
         and window_days >= 7
     )
 
@@ -428,14 +467,34 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         verdict = "no_change"
         reasons = ["No thresholds crossed; metrics are in the comfortable mid-range"]
 
-    if window_days >= 7 and len(reasons) >= 1 and (not up_reasons or len(up_reasons) >= 2):
-        confidence = "high"
-    elif window_days >= 3:
-        confidence = "medium"
-    else:
-        confidence = "low"
+    # Confidence rules from references/thresholds.md. Low: < 3 days, gaps in the data, or any
+    # metric near a threshold boundary. High: >= 7 days of clean data and either no scale-up or a
+    # multi-signal one. Explanations go in confidence_notes, not reasons — merge_verdict.py matches
+    # on reason text to tell which triggers fired.
+    confidence_notes = []
+    low_coverage = {m: summary[m]["coverage"] for m in CORE_METRICS if summary[m]["coverage"] < MIN_COVERAGE}
+    if low_coverage:
+        confidence_notes.append(
+            "Gaps in the data (non-null share of data points below "
+            f"{MIN_COVERAGE:.0%}): " + ", ".join(f"{m} {c:.0%}" for m, c in low_coverage.items())
+            + " — restarts, a pause, or a cluster newer than the window."
+        )
+    near = [(label, observed, cutoff) for label, observed, cutoff in checks
+            if abs(observed - cutoff) <= NEAR_THRESHOLD_BAND * cutoff]
+    if near:
+        confidence_notes.append(
+            f"Near a threshold (within {NEAR_THRESHOLD_BAND:.0%}): "
+            + ", ".join(f"{label} {observed:.4g} vs {cutoff:.4g}" for label, observed, cutoff in near)
+        )
 
-    return verdict, reasons, confidence, summary
+    if window_days < 3 or low_coverage or near:
+        confidence = "low"
+    elif window_days >= 7 and (not up_reasons or len(up_reasons) >= 2):
+        confidence = "high"
+    else:
+        confidence = "medium"
+
+    return verdict, reasons, confidence, confidence_notes, summary
 
 
 def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
@@ -464,7 +523,7 @@ def evaluate_router_group(session, group_id, procs, period, granularity):
         if not pid:
             continue
         m = _fetch_measurements(
-            session, f"{ATLAS_BASE}/groups/{group_id}/processes/{pid}/measurements",
+            session, f"/groups/{group_id}/processes/{pid}/measurements",
             HOST_METRICS, period, granularity,
         )
         for name, values in m.items():
@@ -484,11 +543,19 @@ def build_report(group_id, results, window_label):
         for reason in r["reasons"]:
             lines.append(f"- {reason}")
         lines.append("")
-        lines.append("| Metric | p50 | p95 | max | samples |")
-        lines.append("|---|---|---|---|---|")
+        if r["confidence_notes"]:
+            lines.append("Confidence notes:")
+            for note in r["confidence_notes"]:
+                lines.append(f"- {note}")
+            lines.append("")
+        lines.append("| Metric | p50 | p95 | max | samples | coverage |")
+        lines.append("|---|---|---|---|---|---|")
         for name, s in r["metric_summary"].items():
             if s:
-                lines.append(f"| {name} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} |")
+                lines.append(f"| {name} | {s['p50']} | {s['p95']} | {s['max']} | {s['n']} | "
+                             f"{s['coverage']:.0%} |")
+            else:
+                lines.append(f"| {name} | — | — | — | 0 | 0% |")
         lines.append("")
     lines.append("---")
     lines.append("This is a read-only recommendation. No cluster was modified. Verify thresholds")
@@ -562,7 +629,7 @@ def main():
             results.append({
                 "cluster": name, "current_tier": tier_display, "verdict": "not_supported",
                 "reasons": ["Free/shared tier does not expose full hardware measurements"],
-                "confidence": "n/a", "metric_summary": {},
+                "confidence": "n/a", "confidence_notes": [], "metric_summary": {},
             })
             continue
 
@@ -595,14 +662,15 @@ def main():
             group_procs = next(iter(shard_groups.values()), [])
             cfg["_provisioned_iops"] = provisioned_iops
             cfg["_max_connections"] = max_connections
-            verdict, reasons, confidence, summary = evaluate_process_group(
+            verdict, reasons, confidence, confidence_notes, summary = evaluate_process_group(
                 session, args.group_id, group_procs, cfg, period, granularity, window_days
             )
             if iops_note:
                 reasons = reasons + [iops_note]
             results.append({
                 "cluster": name, "current_tier": tier_display, "verdict": verdict,
-                "reasons": reasons, "confidence": confidence, "metric_summary": summary,
+                "reasons": reasons, "confidence": confidence,
+                "confidence_notes": confidence_notes, "metric_summary": summary,
             })
         else:
             # Sharded topology detected (more than one replica set matched, and/or routers present)
@@ -612,7 +680,7 @@ def main():
                 shard_cfg = dict(cfg)
                 shard_cfg["_provisioned_iops"] = provisioned_iops
                 shard_cfg["_max_connections"] = max_connections
-                verdict, reasons, confidence, summary = evaluate_process_group(
+                verdict, reasons, confidence, confidence_notes, summary = evaluate_process_group(
                     session, args.group_id, shard_groups[rs_name], shard_cfg, period, granularity, window_days
                 )
                 if iops_note:
@@ -620,7 +688,7 @@ def main():
                 results.append({
                     "cluster": f"{name} — shard {rs_name}", "current_tier": tier_display,
                     "verdict": verdict, "reasons": reasons, "confidence": confidence,
-                    "metric_summary": summary,
+                    "confidence_notes": confidence_notes, "metric_summary": summary,
                 })
             if routers:
                 router_summary = evaluate_router_group(session, args.group_id, routers, period, granularity)
@@ -629,7 +697,7 @@ def main():
                     "verdict": "not_applicable",
                     "reasons": ["mongos routers have no local storage or WiredTiger cache — shown "
                                 "for visibility only, not evaluated against rightsizing thresholds"],
-                    "confidence": "n/a", "metric_summary": router_summary,
+                    "confidence": "n/a", "confidence_notes": [], "metric_summary": router_summary,
                 })
 
     report_md = build_report(args.group_id, results, window_label)

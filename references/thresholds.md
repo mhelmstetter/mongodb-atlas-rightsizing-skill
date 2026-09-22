@@ -144,22 +144,29 @@ None of the above triggers, OR signals are mixed/borderline (e.g. p95 CPU at 55%
 mid-range) — say so plainly rather than forcing a recommendation. "Currently well-matched" is a
 valid and useful output.
 
-**This is different from "insufficient data."** If a cluster/shard returns zero metrics for the
-whole requested window (too new — check its creation time — paused, or unreachable), the script
-reports `insufficient_data` / confidence `low`, not `no_change` / high confidence. Confirmed as a
-real failure mode: a cluster created ~30 minutes before a 7-day audit ran against it returned a
-completely empty metric table, and without this distinction the script reported "no thresholds
-crossed, confidence: high" — indistinguishable from a genuinely healthy, well-observed cluster.
-Never treat an empty metrics table as "no change" yourself either, even if summarizing verbally.
+**This is different from "insufficient data."** If any core metric (`CORE_METRICS` in
+`rightsizing.py`: normalized CPU user/kernel, memory used/free, connections, disk IOPS read/write,
+disk space used) has no data points in the requested window (too new — check its creation time —
+paused, or unreachable), the script reports `insufficient_data` / confidence `low`, not
+`no_change` / high confidence. Every threshold check is guarded on its metric being present, so
+without this a missing metric would silently skip its checks. Confirmed as a real failure mode: a
+cluster created ~30 minutes before a 7-day audit ran against it returned a completely empty metric
+table, and the script reported "no thresholds crossed, confidence: high". Never treat an empty
+metrics table as "no change" yourself either, even if summarizing verbally.
+
+API errors (including a 429 that persists after retries) and requested measurement names missing
+from a response stop the script rather than dropping that metric.
 
 ## Confidence levels
 
-- **High**: ≥ 7 days of clean data, signal consistent across the whole window, single clear
-  driver.
-- **Medium**: shorter window (3–6 days), or signal present but not on every day, or multiple
-  competing signals.
-- **Low**: < 3 days of data, or metrics near the threshold boundary, or gaps in the data (node
-  restarts, etc.). Say so and suggest re-running with a longer window before acting.
+- **High**: ≥ 7 days of clean data and none of the Low conditions; for a scale-up, at least two
+  signals fired (a single-signal scale-up is Medium).
+- **Medium**: 3–6 day window, or a single-signal scale-up.
+- **Low**: < 3 days of data, or gaps in the data — any core metric with less than 90% non-null
+  data points (`MIN_COVERAGE`; node restarts, a pause, a cluster newer than the window) — or any
+  threshold check with its value within 10% of the cutoff on either side (`NEAR_THRESHOLD_BAND`).
+  The report lists which of these applied under "Confidence notes". Say so and suggest re-running
+  with a longer window before acting.
 
 ## M-tier reference (vCPU / RAM) — for reasoning about headroom between tiers
 
