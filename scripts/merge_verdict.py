@@ -205,7 +205,8 @@ def analyze_disk(reasons, db, window_label):
 
 def analyze_result(result, db_diagnostics, window_label):
     """Run all combination rules for one rightsizing result (one cluster or shard)."""
-    if result["verdict"] not in EVALUATED_VERDICTS:
+    # db_diagnostics.py connects to mongod/mongos, so it says nothing about search nodes.
+    if result["component"] != "mongod" or result["verdict"] not in EVALUATED_VERDICTS:
         return []
     reasons = result["reasons"]
     db = db_diagnostics["server_status_summary"]
@@ -227,7 +228,8 @@ def build_merged_report(rightsizing_report, db_diagnostics, db_diagnostics_path)
     lines.append("")
 
     results = rightsizing_report["results"]
-    multi_shard = len([r for r in results if r["verdict"] in EVALUATED_VERDICTS]) > 1
+    multi_shard = len([r for r in results if r["component"] == "mongod"
+                       and r["verdict"] in EVALUATED_VERDICTS]) > 1
 
     if not db_diagnostics:
         lines.append("**Mode: ATLAS-ONLY** — no `--db-diagnostics` file provided. The verdicts "

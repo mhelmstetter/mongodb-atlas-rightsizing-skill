@@ -26,11 +26,12 @@ Only dependency: `requests` (pip install requests).
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import requests
@@ -123,6 +124,57 @@ MIN_COVERAGE = 0.90
 # references/thresholds.md says that caps confidence at 'low'.
 NEAR_THRESHOLD_BAND = 0.10
 
+# Dedicated search nodes (mongot). They aren't in the /processes list and have no Admin API
+# listing of their own; their hostnames appear only on host-level mongot/search events. Given a
+# hostname, /processes/{host}:{port}/measurements serves the full OS + FTS series for it
+# (verified live against S30/S100 search nodes).
+SEARCH_NODE_METRICS = [
+    "SYSTEM_NORMALIZED_CPU_USER",
+    "SYSTEM_NORMALIZED_CPU_KERNEL",
+    "SYSTEM_NORMALIZED_CPU_IOWAIT",   # context only
+    "SYSTEM_MEMORY_USED",
+    "SYSTEM_MEMORY_FREE",
+    "SYSTEM_MEMORY_CACHED",
+    "SYSTEM_MEMORY_BUFFERS",
+    "SYSTEM_MEMORY_AVAILABLE",
+    "FTS_DISK_USAGE",                 # on-disk size of the search indexes on this node
+    "FTS_PROCESS_RESIDENT_MEMORY",    # context only
+]
+SEARCH_CORE_METRICS = [
+    "SYSTEM_NORMALIZED_CPU_TOTAL",
+    "SYSTEM_MEMORY_AVAILABLE_PERCENT",
+    "SEARCH_INDEX_RAM_PERCENT",       # derived: FTS_DISK_USAGE / total RAM per data point
+]
+# Every host-level mongot/search event type (EventTypeForNdsGroup in the Admin API spec). Each
+# carries the search node's hostname and port.
+SEARCH_HOST_EVENTS = [
+    "HOST_MONGOT_APPROACHING_STOP_REPLICATION", "HOST_MONGOT_CRASHING_OOM",
+    "HOST_MONGOT_PAUSE_INITIAL_SYNC", "HOST_MONGOT_RECOVERED_OOM", "HOST_MONGOT_RESTARTED",
+    "HOST_MONGOT_RESUME_REPLICATION", "HOST_MONGOT_STOP_REPLICATION",
+    "HOST_MONGOT_SUFFICIENT_DISK_SPACE", "HOST_MONGOT_UNPAUSE_INITIAL_SYNC",
+    "HOST_SEARCH_NODE_INDEX_FAILED", "HOST_SEARCH_NODE_UNBLOCKED",
+    "HOST_SEARCH_PROCESS_NOT_THROTTLING", "HOST_SEARCH_PROCESS_THROTTLING",
+]
+# The subset that is direct evidence of an undersized search node — any occurrence in the window
+# is a scale-up reason. Disk capacity isn't exposed for search nodes, so the replication events
+# are the disk check.
+SEARCH_PRESSURE_EVENTS = {
+    "HOST_MONGOT_CRASHING_OOM": "mongot crashed out of memory",
+    "HOST_SEARCH_PROCESS_THROTTLING": "search process throttled",
+    "HOST_MONGOT_APPROACHING_STOP_REPLICATION": "disk nearly full — index replication about to stop",
+    "HOST_MONGOT_STOP_REPLICATION": "disk full — index replication stopped",
+}
+# How far back to look for events naming each search node. Atlas restarts mongot at maintenance
+# (twice a month on the live project this was built against), so 90 days reliably covers every
+# current node; the node count is checked against the deployment spec either way.
+SEARCH_DISCOVERY_DAYS = 90
+# Node-count rule: when every node in a group is mostly idle, project the group's load onto fewer
+# nodes (assumes search load spreads evenly across nodes — a heuristic) and keep the projected
+# per-node CPU p95 under SEARCH_TARGET_CPU_PCT, never below SEARCH_MIN_NODES (Atlas's minimum).
+SEARCH_TARGET_CPU_PCT = 50
+SEARCH_MIN_NODES = 2
+SEARCH_HOST_RE = re.compile(r"^.+-(shard|config)-(\d+)-search-(\w+)$")
+
 # Scale-up kinds that can be addressed by changing storage/IOPS without a compute tier change.
 DISK_ONLY_KINDS = {"iops", "disk_space", "disk_latency"}
 
@@ -177,11 +229,14 @@ def _get_oauth_token(client_id, client_secret):
     return resp.json()["access_token"]
 
 
-def api_get(session, path, params=None):
+def api_get(session, path, params=None, absent_error_code=None):
     """GET an Atlas Admin API path (relative to ATLAS_BASE). Retries 429 rate-limit responses
     (auditing many processes/partitions can hit Atlas's per-project limit); any other error, or a
     429 that persists past MAX_RETRIES, exits — a partial metric set must never be evaluated as if
-    it were complete."""
+    it were complete.
+
+    absent_error_code: a 404 with exactly this Atlas errorCode means "the resource doesn't exist"
+    and returns None instead of exiting (used for retired search nodes: HOST_NOT_FOUND)."""
     for attempt in range(MAX_RETRIES + 1):
         resp = session.get(f"{ATLAS_BASE}{path}", params=params, timeout=30)
         if resp.status_code == 429 and attempt < MAX_RETRIES:
@@ -189,6 +244,8 @@ def api_get(session, path, params=None):
             # "Retry-After: 0" while still empty, so back off at least 1, 2, 4, ... 32s (63s total).
             time.sleep(max(int(resp.headers.get("Retry-After", 0)), 2 ** attempt))
             continue
+        if absent_error_code and resp.status_code == 404 and resp.json()["errorCode"] == absent_error_code:
+            return None
         if not resp.ok:
             sys.exit(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
         return resp.json()
@@ -285,17 +342,23 @@ def group_processes_by_replica_set(procs):
     return shard_groups, routers
 
 
-def _fetch_measurements(session, path, metric_names, period, granularity):
+def _fetch_measurements(session, path, metric_names, period, granularity, absent_error_code=None,
+                        with_timestamps=False):
     """Returns {metric_name: [value or None, ...]} — one entry per data point Atlas returned,
     INCLUDING null values. Nulls mark gaps (restarts, pauses, or time before the cluster existed)
-    and are kept so evaluate_cluster() can measure data coverage, not just the non-null samples."""
+    and are kept so evaluate_cluster() can measure data coverage, not just the non-null samples.
+    With with_timestamps, returns (that dict, {metric_name: [timestamp, ...]})."""
     query = [("granularity", granularity), ("period", period)] + [("m", m) for m in metric_names]
-    data = api_get(session, path, params=query)
+    data = api_get(session, path, params=query, absent_error_code=absent_error_code)
+    if data is None:
+        return None
     out = {m["name"]: [dp["value"] for dp in m["dataPoints"]] for m in data["measurements"]}
     missing = [m for m in metric_names if m not in out]
     if missing:
         sys.exit(f"Atlas returned no series for {missing} on {path} — the measurement names may "
                  f"have changed; check the current MeasurementView enum.")
+    if with_timestamps:
+        return out, {m["name"]: [dp["timestamp"] for dp in m["dataPoints"]] for m in data["measurements"]}
     return out
 
 
@@ -305,6 +368,29 @@ def _combine(fn, label, *series):
     if len({len(s) for s in series}) != 1:
         sys.exit(f"Cannot combine {label}: series lengths differ ({[len(s) for s in series]}).")
     return [None if None in point else fn(*point) for point in zip(*series)]
+
+
+GRANULARITY_SECONDS = {"PT1M": 60, "PT1H": 3600}
+
+
+def _combine_nearest(fn, label, granularity, base, base_times, other, other_times):
+    """Point-by-point combination of series that Atlas samples on different clocks within one
+    response (verified live on a search node: mongot's FTS_* points at :39 past each hour, 168 of
+    them; the host's SYSTEM_* points at :17, 167 of them). Pairs each `base` point with the `other`
+    point nearest in time; exits if that point is a full granularity step or more away. A point is
+    None if either input is None."""
+    step = GRANULARITY_SECONDS[granularity]
+    parse = lambda t: datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+    other_ts = [parse(t) for t in other_times]
+    out = []
+    for value, t in zip(base, base_times):
+        ts = parse(t)
+        i = min(range(len(other_ts)), key=lambda j: abs(other_ts[j] - ts))
+        if abs(other_ts[i] - ts) >= step:
+            sys.exit(f"Cannot combine {label}: no point within {granularity} of {t} "
+                     f"(nearest is {other_times[i]}).")
+        out.append(None if value is None or other[i] is None else fn(value, other[i]))
+    return out
 
 
 def get_measurements(session, group_id, process_id, period, granularity):
@@ -365,6 +451,38 @@ def summarize(points):
         "n": len(values),
         "coverage": round(len(values) / len(points), 3),
     }
+
+
+def assess_confidence(checks, low_coverage, skipped, up, window_days):
+    """Confidence rules from references/thresholds.md. Low: < 3 days, gaps in the data, or any
+    metric near a threshold boundary. Medium at most if a check was skipped. High: >= 7 days of
+    clean data and either no scale-up or a multi-signal one. Explanations go in confidence_notes,
+    not reasons — merge_verdict.py matches on reason text to tell which triggers fired.
+
+    checks: [(label, observed, cutoff)]; low_coverage: {metric: coverage}; skipped: [note];
+    up: [(kind, reason)]. Returns (confidence, confidence_notes)."""
+    confidence_notes = list(skipped)
+    if low_coverage:
+        confidence_notes.append(
+            "Gaps in the data (non-null share of data points below "
+            f"{MIN_COVERAGE:.0%}): " + ", ".join(f"{m} {c:.0%}" for m, c in low_coverage.items())
+            + " — restarts, a pause, or a cluster newer than the window."
+        )
+    near = [(label, observed, cutoff) for label, observed, cutoff in checks
+            if abs(observed - cutoff) <= NEAR_THRESHOLD_BAND * cutoff]
+    if near:
+        confidence_notes.append(
+            f"Near a threshold (within {NEAR_THRESHOLD_BAND:.0%}): "
+            + ", ".join(f"{label} {observed:.4g} vs {cutoff:.4g}" for label, observed, cutoff in near)
+        )
+
+    if window_days < 3 or low_coverage or near:
+        confidence = "low"
+    elif window_days >= 7 and not skipped and (not up or len(up) >= 2):
+        confidence = "high"
+    else:
+        confidence = "medium"
+    return confidence, confidence_notes
 
 
 def evaluate_cluster(cluster_cfg, process_metrics, window_days):
@@ -563,31 +681,7 @@ def evaluate_cluster(cluster_cfg, process_metrics, window_days):
         verdict = "no_change"
         reasons = ["No thresholds crossed; metrics are in the comfortable mid-range"]
 
-    # Confidence rules from references/thresholds.md. Low: < 3 days, gaps in the data, or any
-    # metric near a threshold boundary. Medium at most if a check was skipped. High: >= 7 days of
-    # clean data and either no scale-up or a multi-signal one. Explanations go in confidence_notes,
-    # not reasons — merge_verdict.py matches on reason text to tell which triggers fired.
-    confidence_notes = list(skipped)
-    if low_coverage:
-        confidence_notes.append(
-            "Gaps in the data (non-null share of data points below "
-            f"{MIN_COVERAGE:.0%}): " + ", ".join(f"{m} {c:.0%}" for m, c in low_coverage.items())
-            + " — restarts, a pause, or a cluster newer than the window."
-        )
-    near = [(label, observed, cutoff) for label, observed, cutoff in checks
-            if abs(observed - cutoff) <= NEAR_THRESHOLD_BAND * cutoff]
-    if near:
-        confidence_notes.append(
-            f"Near a threshold (within {NEAR_THRESHOLD_BAND:.0%}): "
-            + ", ".join(f"{label} {observed:.4g} vs {cutoff:.4g}" for label, observed, cutoff in near)
-        )
-
-    if window_days < 3 or low_coverage or near:
-        confidence = "low"
-    elif window_days >= 7 and not skipped and (not up or len(up) >= 2):
-        confidence = "high"
-    else:
-        confidence = "medium"
+    confidence, confidence_notes = assess_confidence(checks, low_coverage, skipped, up, window_days)
 
     return verdict, reasons, confidence, confidence_notes, summary
 
@@ -605,21 +699,11 @@ def _by_node(per_node, all_nodes):
             for text, nodes in nodes_for.items()]
 
 
-def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
-    """Evaluate one group of processes (a shard, a config-server RS, or a whole non-sharded
-    cluster). Each node is evaluated on its own and the results combined: pooling samples across
-    nodes before taking p95 lets idle secondaries dilute a hot primary (with two idle secondaries
-    the primary is only a third of the samples). Connection limits and provisioned IOPS are
-    per-node ceilings too.
-
-    Group verdict: insufficient_data if any node has it, then scale_up, then change_disk_or_iops if
-    any node needs it; scale_down_candidate only if every node qualifies, otherwise no_change.
-    Confidence is the lowest across nodes."""
-    nodes = {}
-    for p in procs:
-        metrics = get_measurements(session, group_id, p["id"], period, granularity)
-        nodes[node_label(p)] = evaluate_cluster(cfg, {p["id"]: metrics}, window_days)
-
+def combine_nodes(nodes, scale_down_reason):
+    """Combine per-node (verdict, reasons, confidence, confidence_notes, summary) tuples into one
+    group result. Group verdict: insufficient_data if any node has it, then scale_up, then
+    change_disk_or_iops if any node needs it; scale_down_candidate only if every node qualifies,
+    otherwise no_change. Confidence is the lowest across nodes."""
     verdicts = {v for v, _, _, _, _ in nodes.values()}
     if "insufficient_data" in verdicts:
         verdict = "insufficient_data"
@@ -639,8 +723,7 @@ def evaluate_process_group(session, group_id, procs, cfg, period, granularity, w
         reasons = _by_node([(node, reason) for node, (v, node_reasons, _, _, _) in nodes.items()
                             if v in ("scale_up", "change_disk_or_iops") for reason in node_reasons], nodes)
     elif verdict == "scale_down_candidate":
-        reasons = ["CPU, memory, disk, IOPS, and connections all comfortably under scale-down "
-                   "thresholds on every node"]
+        reasons = [scale_down_reason]
     else:
         reasons = ["No thresholds crossed on any node; metrics are in the comfortable mid-range"]
 
@@ -649,6 +732,20 @@ def evaluate_process_group(session, group_id, procs, cfg, period, granularity, w
                                  for note in notes], nodes)
     summary = {node: node_summary for node, (_, _, _, _, node_summary) in nodes.items()}
     return verdict, reasons, confidence, confidence_notes, summary
+
+
+def evaluate_process_group(session, group_id, procs, cfg, period, granularity, window_days):
+    """Evaluate one group of processes (a shard, a config-server RS, or a whole non-sharded
+    cluster). Each node is evaluated on its own and the results combined (combine_nodes): pooling
+    samples across nodes before taking p95 lets idle secondaries dilute a hot primary (with two
+    idle secondaries the primary is only a third of the samples). Connection limits and
+    provisioned IOPS are per-node ceilings too."""
+    nodes = {}
+    for p in procs:
+        metrics = get_measurements(session, group_id, p["id"], period, granularity)
+        nodes[node_label(p)] = evaluate_cluster(cfg, {p["id"]: metrics}, window_days)
+    return combine_nodes(nodes, "CPU, memory, disk, IOPS, and connections all comfortably under "
+                                "scale-down thresholds on every node")
 
 
 def evaluate_router_group(session, group_id, procs, period, granularity):
@@ -667,6 +764,186 @@ def evaluate_router_group(session, group_id, procs, period, granularity):
         )
         summary[node_label(p)] = {name: summarize(vals) for name, vals in m.items()}
     return summary
+
+
+def list_events(session, group_id, cluster_name, event_types, since):
+    """Every event of the given types for one cluster since `since` (ISO 8601), all pages."""
+    events, page = [], 1
+    while True:
+        data = api_get(session, f"/groups/{group_id}/events", params={
+            "clusterNames": cluster_name, "eventType": event_types, "minDate": since,
+            "itemsPerPage": 500, "pageNum": page})
+        events.extend(data["results"])
+        if len(events) >= data["totalCount"] or not data["results"]:
+            break
+        page += 1
+    return events
+
+
+def get_search_measurements(session, group_id, host, period, granularity):
+    """Measurements for one search node, or None if Atlas reports the host doesn't exist
+    (HOST_NOT_FOUND — a node replaced since the event that named it)."""
+    fetched = _fetch_measurements(session, f"/groups/{group_id}/processes/{host}/measurements",
+                                  SEARCH_NODE_METRICS, period, granularity,
+                                  absent_error_code="HOST_NOT_FOUND", with_timestamps=True)
+    if fetched is None:
+        return None
+    out, times = fetched
+    out["SYSTEM_NORMALIZED_CPU_TOTAL"] = _combine(
+        lambda u, k: u + k, "CPU user+kernel",
+        out["SYSTEM_NORMALIZED_CPU_USER"], out["SYSTEM_NORMALIZED_CPU_KERNEL"])
+    out["SYSTEM_MEMORY_AVAILABLE_PERCENT"] = _combine(
+        lambda a, u, f, c, b: 100 * a / (u + f + c + b), "memory available/total",
+        out["SYSTEM_MEMORY_AVAILABLE"], out["SYSTEM_MEMORY_USED"], out["SYSTEM_MEMORY_FREE"],
+        out["SYSTEM_MEMORY_CACHED"], out["SYSTEM_MEMORY_BUFFERS"])
+    # FTS_DISK_USAGE is bytes; the SYSTEM_MEMORY_* series are kilobytes. The two come from
+    # different samplers (mongot vs the host), so they're paired by time, not by position.
+    total_kb = _combine(lambda u, f, c, b: u + f + c + b, "total RAM",
+                        out["SYSTEM_MEMORY_USED"], out["SYSTEM_MEMORY_FREE"],
+                        out["SYSTEM_MEMORY_CACHED"], out["SYSTEM_MEMORY_BUFFERS"])
+    out["SEARCH_INDEX_RAM_PERCENT"] = _combine_nearest(
+        lambda d, kb: 100 * d / (kb * 1024), "search index size/RAM", granularity,
+        out["FTS_DISK_USAGE"], times["FTS_DISK_USAGE"], total_kb, times["SYSTEM_MEMORY_USED"])
+    return out
+
+
+def evaluate_search_node(metrics, pressure_events, window_days):
+    """Search-node rules (references/thresholds.md "Search nodes"). Returns the same 5-tuple as
+    evaluate_cluster(). pressure_events: {event type: count} for this node within the window."""
+    summary = {name: summarize(vals) for name, vals in metrics.items()}
+    missing_core = [m for m in SEARCH_CORE_METRICS if not summary[m]]
+    if missing_core:
+        return ("insufficient_data",
+                [f"No data in the requested window for: {', '.join(missing_core)}."],
+                "low", [], summary)
+
+    checks = []
+
+    def exceeds(label, observed, cutoff, above=True):
+        checks.append((label, observed, cutoff))
+        return observed > cutoff if above else observed < cutoff
+
+    up = []
+    cpu = summary["SYSTEM_NORMALIZED_CPU_TOTAL"]
+    if exceeds("CPU (user+kernel) p95", cpu["p95"], 80):
+        up.append(("cpu", f"CPU p95 {cpu['p95']}% (user+kernel) > 80% threshold"))
+    mem_avail_pct = summary["SYSTEM_MEMORY_AVAILABLE_PERCENT"]
+    if exceeds("Available memory p5", mem_avail_pct["p5"], 10, above=False):
+        up.append(("memory", f"Available memory p5 {mem_avail_pct['p5']}% < 10% of total"))
+    # mongot serves queries from the index through the OS page cache (the index is memory-mapped,
+    # which is why available memory stays high); once the index outgrows RAM, queries go to disk.
+    index_pct = summary["SEARCH_INDEX_RAM_PERCENT"]
+    if exceeds("Search index size / RAM p95", index_pct["p95"], 90):
+        up.append(("search_index_memory",
+                   f"Search index size p95 {index_pct['p95']}% of RAM > 90% heuristic — the index "
+                   f"no longer fits in memory"))
+    for event_type, count in sorted(pressure_events.items()):
+        up.append(("search_event", f"{count} × {event_type} in the window ({SEARCH_PRESSURE_EVENTS[event_type]})"))
+
+    low_coverage = {m: summary[m]["coverage"] for m in SEARCH_CORE_METRICS if summary[m]["coverage"] < MIN_COVERAGE}
+    # Scale-down: CPU mostly idle and the index would still fit comfortably in a tier with half the
+    # RAM (< 40% now -> < 80% there).
+    down_ok = (cpu["p95"] < 20 and index_pct["p95"] < 40 and not pressure_events
+               and not low_coverage and window_days >= 7)
+
+    if up:
+        verdict, reasons = "scale_up", [reason for _, reason in up]
+    elif down_ok:
+        verdict, reasons = "scale_down_candidate", []
+    else:
+        verdict, reasons = "no_change", ["No thresholds crossed"]
+    confidence, confidence_notes = assess_confidence(checks, low_coverage, [], up, window_days)
+    return verdict, reasons, confidence, confidence_notes, summary
+
+
+def evaluate_search_deployment(session, group_id, cluster_cfg, period, granularity, window_days, window_start):
+    """One result per shard's search nodes, or [] if the cluster has none."""
+    name = cluster_cfg["name"]
+    deployment = api_get(session, f"/groups/{group_id}/clusters/{name}/search/deployment")
+    if not deployment:  # {} when the cluster has no search nodes
+        return []
+    # Without a shardId, each effectiveSpecs entry applies to every shard (verified live: 4 shards
+    # x nodeCount 9 = 36 search hosts).
+    specs = deployment["effectiveSpecs"]
+    expected = (sum(sp["nodeCount"] for sp in specs) if any("shardId" in sp for sp in specs)
+                else sum(sp["nodeCount"] for sp in specs) * len(cluster_cfg["replicationSpecs"]))
+
+    since = (datetime.now(timezone.utc) - timedelta(days=SEARCH_DISCOVERY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hosts = sorted({f"{e['hostname']}:{e['port']}"
+                    for e in list_events(session, group_id, name, SEARCH_HOST_EVENTS, since)})
+    pressure = {}
+    for e in list_events(session, group_id, name, sorted(SEARCH_PRESSURE_EVENTS), window_start):
+        per_host = pressure.setdefault(f"{e['hostname']}:{e['port']}", {})
+        per_host[e["eventTypeName"]] = per_host.get(e["eventTypeName"], 0) + 1
+
+    groups = {}
+    for host in hosts:
+        label = host.split(".", 1)[0]
+        m = SEARCH_HOST_RE.match(label)
+        if not m:
+            sys.exit(f"Unexpected search node hostname '{host}' for cluster {name}; expected "
+                     f"'<prefix>-(shard|config)-NN-search-<id>'.")
+        metrics = get_search_measurements(session, group_id, host, period, granularity)
+        if metrics is None:
+            continue  # replaced since the event that named it
+        groups.setdefault(f"{m.group(1)}-{m.group(2)}", {})[f"{m.group(1)}-{m.group(2)}-search-{m.group(3)}"] = \
+            evaluate_search_node(metrics, pressure.get(host, {}), window_days)
+
+    found = sum(len(nodes) for nodes in groups.values())
+    if found != expected:
+        sys.exit(f"Found {found} live search nodes for cluster {name} but its search deployment "
+                 f"specifies {expected}. Search node hostnames are only exposed on mongot/search "
+                 f"events (last {SEARCH_DISCOVERY_DAYS} days searched); a node with no event in "
+                 f"that window can't be found.")
+
+    tiers = sorted({sp["instanceSize"] for sp in specs})
+    tier_display = tiers[0] if len(tiers) == 1 else "mixed: " + ", ".join(tiers)
+    notes = []
+    if deployment.get("autoScaling"):
+        notes.append(f"Search node autoscaling is configured ({json.dumps(deployment['autoScaling'])}): "
+                     f"a scale verdict here is about those bounds.")
+    combined = {group: combine_nodes(
+        nodes, "CPU and search index size comfortably under scale-down thresholds on every search "
+               "node (index would fit in a tier with half the RAM)") for group, nodes in groups.items()}
+
+    # Node-count targets per group. Without a shardId, nodeCount is one setting for every shard,
+    # so a recommendation has to hold for the busiest shard.
+    targets, node_notes = {}, []
+    if len(specs) > 1:
+        node_notes.append("Node-count check skipped: the search deployment spans several regions and "
+                          "hostnames don't show which region a node is in.")
+    else:
+        for group, (verdict, _, confidence, _, summary) in combined.items():
+            cpu_p95s = [n["SYSTEM_NORMALIZED_CPU_TOTAL"]["p95"] for n in summary.values()]
+            if (verdict in ("no_change", "scale_down_candidate") and confidence != "low"
+                    and window_days >= 7 and max(cpu_p95s) < 20):
+                targets[group] = max(SEARCH_MIN_NODES, math.ceil(
+                    max(cpu_p95s) * len(groups[group]) / SEARCH_TARGET_CPU_PCT))
+        if "shardId" not in specs[0]:
+            # All groups must qualify for a deployment-wide change; use the busiest shard's target.
+            targets = ({group: max(targets.values()) for group in targets}
+                       if len(targets) == len(groups) else {})
+
+    results = []
+    for group in sorted(groups):
+        verdict, reasons, confidence, confidence_notes, summary = combined[group]
+        count = len(groups[group])
+        if group in targets and targets[group] < count:
+            if verdict == "no_change":
+                verdict, reasons = "reduce_node_count_candidate", []
+            scope = "" if "shardId" in specs[0] else " (nodeCount applies to every shard, so this is sized for the busiest one)"
+            reasons = reasons + [
+                f"Every search node's CPU p95 is under 20%: {targets[group]} nodes instead of {count}"
+                f"{scope} would keep projected CPU p95 under {SEARCH_TARGET_CPU_PCT}%, assuming load "
+                f"spreads evenly across nodes. Node count also sets query redundancy — check "
+                f"availability needs before cutting."]
+        results.append({
+            "cluster": f"{name} — search nodes {group} ({count})", "component": "search",
+            "current_tier": tier_display, "verdict": verdict, "reasons": reasons + notes,
+            "confidence": confidence, "confidence_notes": confidence_notes + node_notes,
+            "metric_summary": summary,
+        })
+    return results
 
 
 def build_report(group_id, results, window_label):
@@ -745,6 +1022,7 @@ def main():
         granularity = "PT1H"
         window_label = f"{args.days} days"
 
+    window_start = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     session = get_session(args)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -769,7 +1047,7 @@ def main():
 
         if len(tiers) == 1 and tiers[0] in ("M0", "M2", "M5"):
             results.append({
-                "cluster": name, "current_tier": tier_display, "verdict": "not_supported",
+                "cluster": name, "component": "cluster", "current_tier": tier_display, "verdict": "not_supported",
                 "reasons": ["Free/shared tier does not expose full hardware measurements"],
                 "confidence": "n/a", "confidence_notes": [], "metric_summary": {},
             })
@@ -797,7 +1075,7 @@ def main():
 
         if cfg["paused"]:
             results.append({
-                "cluster": name, "current_tier": tier_display, "verdict": "paused",
+                "cluster": name, "component": "cluster", "current_tier": tier_display, "verdict": "paused",
                 "reasons": ["Cluster is paused — no processes to measure. Resume it and re-run."],
                 "confidence": "n/a", "confidence_notes": [], "metric_summary": {},
             })
@@ -829,7 +1107,7 @@ def main():
             )
             reasons = reasons + ([iops_note] if iops_note else []) + autoscaling_notes
             results.append({
-                "cluster": name, "current_tier": tier_display, "verdict": verdict,
+                "cluster": name, "component": "mongod", "current_tier": tier_display, "verdict": verdict,
                 "reasons": reasons, "confidence": confidence,
                 "confidence_notes": confidence_notes, "metric_summary": summary,
             })
@@ -846,19 +1124,23 @@ def main():
                 )
                 reasons = reasons + ([iops_note] if iops_note else []) + autoscaling_notes
                 results.append({
-                    "cluster": f"{name} — shard {rs_name}", "current_tier": tier_display,
+                    "cluster": f"{name} — shard {rs_name}", "component": "mongod", "current_tier": tier_display,
                     "verdict": verdict, "reasons": reasons, "confidence": confidence,
                     "confidence_notes": confidence_notes, "metric_summary": summary,
                 })
             if routers:
                 router_summary = evaluate_router_group(session, args.group_id, routers, period, granularity)
                 results.append({
-                    "cluster": f"{name} — mongos routers ({len(routers)})", "current_tier": tier_display,
+                    "cluster": f"{name} — mongos routers ({len(routers)})", "component": "mongos",
+                    "current_tier": tier_display,
                     "verdict": "not_applicable",
                     "reasons": ["mongos routers have no local storage or WiredTiger cache — shown "
                                 "for visibility only, not evaluated against rightsizing thresholds"],
                     "confidence": "n/a", "confidence_notes": [], "metric_summary": router_summary,
                 })
+
+        results.extend(evaluate_search_deployment(
+            session, args.group_id, cfg, period, granularity, window_days, window_start))
 
     report_md = build_report(args.group_id, results, window_label)
     with open(os.path.join(args.out_dir, "report.md"), "w", encoding="utf-8") as f:

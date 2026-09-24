@@ -1,0 +1,3 @@
+# Default rightsizing.py --out-dir: reports hold real hostnames, cluster names, and metrics.
+rightsizing-report/
+__pycache__/
