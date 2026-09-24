@@ -1,6 +1,6 @@
 ---
 name: mongodb-rightsizing
-description: Generate MongoDB Atlas cluster rightsizing recommendations by pulling hardware metrics (CPU, memory, disk IOPS, disk utilization, connections) from the Atlas Admin API and comparing them against tier-appropriate thresholds. Use this skill whenever the user asks about Atlas cluster sizing, whether a cluster is over- or under-provisioned, cost optimization for Atlas clusters, scaling recommendations, "is my cluster too big/small", capacity planning, or wants a report on cluster hardware utilization. Also trigger for requests to audit multiple clusters/projects for sizing issues.
+description: Generate MongoDB Atlas cluster rightsizing recommendations by pulling hardware metrics (CPU, memory, disk IOPS, disk utilization, connections) from the Atlas Admin API and comparing them against tier-appropriate thresholds, including dedicated Atlas Search / Vector Search nodes (tier and node count). Use this skill whenever the user asks about Atlas cluster sizing, search node sizing, whether a cluster is over- or under-provisioned, cost optimization for Atlas clusters, scaling recommendations, "is my cluster too big/small", capacity planning, or wants a report on cluster hardware utilization. Also trigger for requests to audit multiple clusters/projects for sizing issues.
 ---
 
 # MongoDB Atlas Rightsizing
@@ -65,6 +65,13 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
      disk IOPS, latency, or space trigger), or **no change**, with a
      confidence level based on how many days of data were available and how consistently the
      signal held.
+   - If the cluster has dedicated search nodes (`GET /clusters/{name}/search/deployment` isn't
+     `{}`), evaluates them too, as separate `component: "search"` results per shard. Search nodes
+     aren't in `/processes`: their hostnames come from mongot/search events in the last 90 days,
+     and the script exits if the count found doesn't match the deployment spec. Rules cover CPU,
+     available memory, search index size vs. RAM, and OOM/throttling/disk-full events. When every
+     node is mostly idle, the script suggests fewer nodes (`reduce_node_count_candidate`). See
+     "Search nodes" in `references/thresholds.md`.
 
 4. **Present the results**: show `report.md` inline (it's short and this is usually what the
    user actually wants to read), and mention `report.json` is available if they're feeding this
@@ -86,6 +93,10 @@ https://www.mongodb.com/docs/atlas/configure-api-access/
      yourself either. If shards have different provisioned IOPS ("asymmetric" sharding), the
      IOPS-vs-provisioned threshold is skipped for all shards rather than risk comparing a shard's
      usage against the wrong shard's ceiling — the report notes when this happens.
+   - Search nodes: a node-count suggestion assumes search load spreads evenly across nodes, and
+     fewer nodes also means less redundancy for search queries. Say both when presenting one. The
+     index-size-vs-RAM cutoff is a heuristic. `merge_verdict.py` doesn't combine search results
+     with `db_diagnostics.py` (it only sees mongod/mongos).
    - Free/shared tier (M0/M2/M5) clusters don't expose full hardware measurements — the script
      will note this and skip metric-based analysis for them.
 
@@ -128,8 +139,9 @@ comparison is gated the way it is) before hand-tuning `merge_verdict.py`'s thres
 - `scripts/config.example.json` — example config file (alternative to CLI flags/env vars, useful
   for auditing many clusters across projects on a schedule).
 - `references/metrics.md` — the exact Atlas measurement names pulled and why each matters.
-- `references/thresholds.md` — the decision rules (the actual rightsizing logic) and the M-tier
-  reference table (vCPU/RAM per tier) used to reason about headroom.
+- `references/thresholds.md` — the decision rules (the actual rightsizing logic), including the
+  search node rules, and the M-tier reference table (vCPU/RAM per tier) used to reason about
+  headroom.
 - `references/db-diagnostics.md` — how to combine the two data sources, including what to do
   when they disagree.
 

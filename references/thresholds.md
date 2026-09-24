@@ -172,6 +172,89 @@ from a response stop the script rather than dropping that metric.
   The report lists which of these applied under "Confidence notes". Say so and suggest re-running
   with a longer window before acting.
 
+## Search nodes
+
+Dedicated search nodes (mongot, S-tiers such as `S30_LOWCPU_NVME`) are evaluated separately from
+the cluster's mongod nodes, as `component: "search"` results named
+`<cluster> — search nodes <group> (<count>)`. `<group>` is the `shard-NN` / `config-NN` label in
+the search hostnames, which matches the mongod shard the nodes serve. Seen live: a replica set's
+search nodes are `shard-00`, and a config shard's (a config server that also holds data) are
+`config-00`. As with mongod,
+each node is evaluated on its own and the group's verdict is the worst node's. `merge_verdict.py`
+leaves these results out, because `db_diagnostics.py` only sees mongod/mongos.
+
+### Finding the nodes
+
+Search nodes aren't in `/processes` and have no Admin API listing of their own. The script:
+
+1. Reads `GET /clusters/{name}/search/deployment`. `{}` means no search nodes.
+2. Collects hostnames from host-level mongot/search events (`SEARCH_HOST_EVENTS`) over the last
+   90 days (`SEARCH_DISCOVERY_DAYS`). Atlas restarts mongot at maintenance, so every current node
+   has had an event in that window.
+3. Fetches `GET /processes/{host}:{port}/measurements` per host. `HOST_NOT_FOUND` means the node
+   was replaced since its event, and it is skipped.
+4. Exits if the number of live nodes found doesn't equal the deployment spec: the sum of
+   `effectiveSpecs[].nodeCount`, times the number of shards when the specs have no `shardId`
+   (verified live: 4 shards × `nodeCount` 9 = 36 hosts).
+
+### Scale UP triggers (any one is sufficient)
+
+| Signal | Threshold | Window |
+|---|---|---|
+| Normalized CPU (user+kernel) | p95 > 80% | requested window |
+| Memory | available memory p5 < 10% of total RAM (same formula as mongod) | requested window |
+| Search index size / RAM | `FTS_DISK_USAGE` as a share of total RAM, p95 > 90% (heuristic, see below) | requested window |
+| mongot OOM crash | any `HOST_MONGOT_CRASHING_OOM` event | requested window |
+| Search process throttled | any `HOST_SEARCH_PROCESS_THROTTLING` event | requested window |
+| Disk nearly full / full | any `HOST_MONGOT_APPROACHING_STOP_REPLICATION` or `HOST_MONGOT_STOP_REPLICATION` event | requested window |
+
+**Index size vs. RAM.** mongot serves queries from its index through the OS page cache: the index
+is memory-mapped, which is why available memory stays high even on a busy node. Once the index
+outgrows RAM, queries start going to disk. The 90% cutoff is a heuristic, **not derived from
+MongoDB/Atlas documentation**. It is computed per data point, before percentiles are taken.
+`FTS_*` series come from mongot and `SYSTEM_*` series from the host, and they are sampled on
+different clocks. In one live response the FTS points were at :39 past each hour (168 points) and
+the SYSTEM points at :17 (167 points). So each index-size point is paired with the nearest-in-time
+total-RAM point, and the script exits if none is within one granularity step.
+
+**Events stand in for the disk check.** Atlas exposes no disk capacity or IOPS for search nodes.
+The replication-stop events are the only disk-pressure signal.
+
+### Scale DOWN candidate (requires ALL of the following)
+
+- Normalized CPU p95 < 20%
+- Search index size / RAM p95 < 40%, so the index would still fit under 80% in a tier with half
+  the RAM
+- No pressure events in the window
+- No gaps in the core metrics (CPU, available memory, index size / RAM; each ≥ 90% non-null)
+- At least 7 days of data
+
+### Node count
+
+Node count is separate from tier: it sets query throughput and redundancy. When a group qualifies,
+the script suggests `reduce_node_count_candidate` (or adds the suggestion to a
+`scale_down_candidate`). A group qualifies when all of these hold:
+
+- its verdict is `no_change` or `scale_down_candidate`
+- confidence is medium or high
+- the window is ≥ 7 days
+- every node's CPU p95 is under 20%
+
+The target is `max(2, ceil(max node CPU p95 × node count / 50))`, the fewest nodes that keep the
+projected per-node CPU p95 under 50% (`SEARCH_TARGET_CPU_PCT`). Atlas's minimum is 2
+(`SEARCH_MIN_NODES`). The projection assumes load spreads evenly across nodes. That is a
+heuristic, and it hasn't been validated against an actual node reduction.
+
+- **No `shardId` in the spec:** `nodeCount` is one setting for every shard. A reduction is
+  suggested only if every group qualifies, and the busiest group sets the target.
+- **Several `effectiveSpecs` (multi-region):** the check is skipped. Hostnames don't show which
+  region a node is in.
+- Always tell the user that cutting nodes also cuts redundancy for search queries. Check
+  availability needs before acting on it.
+
+Confidence follows the same rules as mongod (see below). If search node autoscaling is configured,
+the report notes it, and a scale verdict is about the autoscaling bounds.
+
 ## M-tier reference (vCPU / RAM) — for reasoning about headroom between tiers
 
 Use this to describe *how much* headroom a scale-up/down would add, not just that one is
