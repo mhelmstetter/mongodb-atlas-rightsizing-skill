@@ -120,7 +120,7 @@ MIN_COVERAGE = 0.90
 # references/thresholds.md says that caps confidence at 'low'.
 NEAR_THRESHOLD_BAND = 0.10
 
-MAX_RETRIES = 5  # for 429 rate-limit responses in api_get()
+MAX_RETRIES = 6  # for 429 rate-limit responses in api_get()
 
 TIER_SPECS = {
     "M10": (2, 2), "M20": (2, 4), "M30": (2, 8), "M40": (4, 16),
@@ -184,7 +184,9 @@ def api_get(session, path, params=None):
     for attempt in range(MAX_RETRIES + 1):
         resp = session.get(f"{ATLAS_BASE}{path}", params=params, timeout=30)
         if resp.status_code == 429 and attempt < MAX_RETRIES:
-            time.sleep(int(resp.headers.get("Retry-After", 2 ** attempt)))
+            # Atlas's per-project token bucket (300 requests, refilling at 100/minute) can answer
+            # "Retry-After: 0" while still empty, so back off at least 1, 2, 4, ... 32s (63s total).
+            time.sleep(max(int(resp.headers.get("Retry-After", 0)), 2 ** attempt))
             continue
         if not resp.ok:
             sys.exit(f"Atlas API error {resp.status_code} on {path}: {resp.text[:500]}")
