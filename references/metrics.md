@@ -1,6 +1,7 @@
 # Metrics pulled from the Atlas Admin API
 
-Two endpoints, because Atlas splits host-level and disk-level measurements:
+Two endpoints, because Atlas splits host-level and disk-level measurements (search nodes use
+the host-level one; see "Search node metrics" below):
 
 - **Host-level**: `GET /api/atlas/v2/groups/{groupId}/processes/{processId}/measurements`
 - **Disk-level**: `GET /api/atlas/v2/groups/{groupId}/processes/{processId}/disks/{partitionName}/measurements`
@@ -59,3 +60,27 @@ independently — one hot shard shouldn't get masked by averaging across a well-
 `rightsizing.py` does this by grouping processes on `replicaSetName`; see its
 `group_processes_by_replica_set()` docstring for caveats (not verified against a live sharded
 cluster).
+
+## Search node metrics (`SEARCH_NODE_METRICS` in `rightsizing.py`)
+
+Dedicated search nodes (mongot) aren't in `/processes`, but given a hostname from a mongot/search
+event, the host-level endpoint serves their measurements:
+`GET /api/atlas/v2/groups/{groupId}/processes/{host}:{port}/measurements` (verified live against
+S30 and S100 search nodes, port 28000). There's no disk sub-resource for them. See "Search nodes"
+in `references/thresholds.md` for how nodes are found and the rules applied.
+
+| Metric | Why it matters for rightsizing |
+|---|---|
+| `SYSTEM_NORMALIZED_CPU_USER` / `KERNEL` | Same as on mongod: summed into `SYSTEM_NORMALIZED_CPU_TOTAL` for the CPU trigger and the node-count projection. |
+| `SYSTEM_NORMALIZED_CPU_IOWAIT` | Context only. |
+| `SYSTEM_MEMORY_USED` / `FREE` / `CACHED` / `BUFFERS` / `AVAILABLE` | Kilobytes. Same available-memory trigger as mongod. Their sum is total RAM, the denominator for index size / RAM. |
+| `FTS_DISK_USAGE` | Bytes. On-disk size of the search indexes on this node. mongot memory-maps the index and serves queries through the OS page cache, so the index outgrowing RAM is the search equivalent of a working set outgrowing the WT cache. |
+| `FTS_PROCESS_RESIDENT_MEMORY` | Bytes. Context only. It tracks the index size (seen live: ~188 GB resident for a ~185 GB index), most likely because mapped index pages count as resident (not verified), so it isn't a pressure signal on its own. |
+
+Derived per data point: `SYSTEM_NORMALIZED_CPU_TOTAL`, `SYSTEM_MEMORY_AVAILABLE_PERCENT` (as on
+mongod), and `SEARCH_INDEX_RAM_PERCENT` (`FTS_DISK_USAGE` / (total RAM KB × 1024)). The `FTS_*`
+and `SYSTEM_*` series are sampled on different clocks even within one response (seen live: FTS
+points at :39 past each hour, 168 of them; SYSTEM points at :17, 167 of them). So
+`SEARCH_INDEX_RAM_PERCENT` pairs each index-size point with the nearest-in-time RAM point, and the
+script exits if none is within one granularity step. Pairing by position would mismatch readings
+taken up to ~40 minutes apart, or crash when the counts differ.
